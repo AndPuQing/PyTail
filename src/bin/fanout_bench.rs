@@ -8,7 +8,7 @@ use axum::routing::get;
 use axum::serve::ListenerExt;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use devpi_rs::config::AppConfig;
+use pytail::config::AppConfig;
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -207,13 +207,13 @@ async fn run_path_scenarios(args: &Args) -> Result<(), Box<dyn std::error::Error
     let cache_dir = args
         .cache_dir
         .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("devpi-rs-path-bench"));
+        .unwrap_or_else(|| std::env::temp_dir().join("pytail-path-bench"));
     let cache_dir = cache_dir.join(unique_suffix());
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_addr = proxy_listener.local_addr()?;
-    let proxy_task = tokio::spawn(devpi_rs::server::serve_listener(
+    let proxy_task = tokio::spawn(pytail::server::serve_listener(
         AppConfig {
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),
@@ -362,13 +362,13 @@ async fn run_scenario(
     let cache_dir = args
         .cache_dir
         .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("devpi-rs-fanout-bench-{name}")));
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("pytail-fanout-bench-{name}")));
     let cache_dir = cache_dir.join(unique_suffix());
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_addr = proxy_listener.local_addr()?;
-    let proxy_task = tokio::spawn(devpi_rs::server::serve_listener(
+    let proxy_task = tokio::spawn(pytail::server::serve_listener(
         AppConfig {
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),

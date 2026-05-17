@@ -1,8 +1,28 @@
 [package]
-name = "devpi-rs"
+name = "pytail"
 version = "0.1.0"
 edition = "2024"
-default-run = "devpi-rs"
+default-run = "pytail"
+autobins = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[features]
+bench-tools = []
+
+[[bin]]
+name = "pytail"
+path = "src/main.rs"
+
+[[bin]]
+name = "fanout_bench"
+path = "src/bin/fanout_bench.rs"
+required-features = ["bench-tools"]
 
 [dependencies]
 axum = "0.8"
@@ -10,7 +30,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "http2", "json", "native-tls", "stream", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
@@ -19,7 +39,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["compression-gzip"] }
+tower-http = "0.6"
 url = "2"
 
 [dev-dependencies]

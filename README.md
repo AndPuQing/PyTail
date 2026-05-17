@@ -1,6 +1,6 @@
-# devpi-rs
+# PyTail
 
-`devpi-rs` has been rewritten into a minimal lazy PyPI caching proxy.
+`pytail` is a minimal incremental PyPI caching mirror.
 
 It is no longer a `devpi` clone. The new server only does four things:
 
@@ -65,7 +65,7 @@ resolution as long as:
 cargo run -- \
   --bind 127.0.0.1:3141 \
   --upstream-base-url https://pypi.org \
-  --cache-dir .cache/devpi-rs
+  --cache-dir .cache/pytail
 ```
 
 Then point tools at it:
@@ -79,9 +79,25 @@ pip install --index-url http://127.0.0.1:3141/simple/ requests
 
 - `--bind`: listen address, default `127.0.0.1:3141`
 - `--upstream-base-url`: upstream index origin, default `https://pypi.org`
-- `--cache-dir`: local cache directory, default `.cache/devpi-rs`
+- `--cache-dir`: local cache directory, default `.cache/pytail`
 - `--project-cache-ttl-secs`: refresh age for cached project pages, default `900`
 - `--request-timeout-secs`: upstream HTTP timeout, default `15`
+
+## Package
+
+Build a Python wheel with `maturin`:
+
+```sh
+maturin build --release
+```
+
+Publish to PyPI:
+
+```sh
+maturin publish --release
+```
+
+The wheel installs the `pytail` command as a native Rust binary.
 
 ## Cache Layout
 

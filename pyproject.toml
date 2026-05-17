@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.13,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pytail"
+version = "0.1.0"
+description = "Incremental PyPI Simple API caching mirror"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Archiving :: Mirroring",
+]
+
+[tool.maturin]
+bindings = "bin"
+strip = true

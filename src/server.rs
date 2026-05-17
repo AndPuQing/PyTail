@@ -34,7 +34,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
-use tower_http::compression::{CompressionLayer, CompressionLevel};
 use url::Url;
 
 #[derive(Clone)]
@@ -154,41 +153,7 @@ fn app(state: AppState) -> Router {
             "/root/pypi/{plusf}/{route_a}/{route_b}/{filename}",
             get(package_file),
         )
-        .layer(
-            CompressionLayer::new()
-                .quality(CompressionLevel::Fastest)
-                .compress_when(should_compress_simple_response),
-        )
         .with_state(Arc::new(state))
-}
-
-fn should_compress_simple_response(
-    status: StatusCode,
-    _version: axum::http::Version,
-    headers: &HeaderMap,
-    _extensions: &axum::http::Extensions,
-) -> bool {
-    if status != StatusCode::OK {
-        return false;
-    }
-    let Some(content_length) = headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-    else {
-        return false;
-    };
-    if content_length < 64 * 1024 {
-        return false;
-    }
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| {
-            content_type.starts_with("text/html")
-                || content_type.starts_with(json_media_type())
-                || content_type.starts_with("application/json")
-        })
 }
 
 async fn root_redirect() -> impl IntoResponse {

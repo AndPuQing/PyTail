@@ -52,7 +52,7 @@ impl UpstreamClient {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(timeout_secs))
             .read_timeout(Duration::from_secs(timeout_secs))
-            .user_agent(format!("devpi-rs/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("pytail/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(io_other)?;
         Ok(Self { base_url, client })

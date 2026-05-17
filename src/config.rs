@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "devpi-rs",
+    name = "pytail",
     version,
-    about = "Lazy PyPI Simple API caching proxy"
+    about = "Incremental PyPI Simple API caching mirror"
 )]
 pub struct AppConfig {
     #[arg(long, default_value = "127.0.0.1:3141")]
@@ -14,7 +14,7 @@ pub struct AppConfig {
     #[arg(long, default_value = "https://pypi.org")]
     pub upstream_base_url: String,
 
-    #[arg(long, default_value = ".cache/devpi-rs")]
+    #[arg(long, default_value = ".cache/pytail")]
     pub cache_dir: PathBuf,
 
     #[arg(long, default_value_t = 900)]
