@@ -314,11 +314,14 @@ pub fn render_project_json_with_file_base(
                 "url".to_string(),
                 Value::String(local_file_url_with_base(project, link, file_base_path)),
             );
-            if let Some(hash_name) = &link.hash_name
+            let hashes = if let Some(hash_name) = &link.hash_name
                 && let Some(hash_value) = &link.hash_value
             {
-                value.insert("hashes".to_string(), json!({ hash_name: hash_value }));
-            }
+                json!({ hash_name: hash_value })
+            } else {
+                json!({})
+            };
+            value.insert("hashes".to_string(), hashes);
             if let Some(value_text) = &link.requires_python {
                 value.insert(
                     "requires-python".to_string(),
@@ -539,5 +542,27 @@ mod tests {
         assert!(html.contains("<title>Links for demo</title>"));
         assert!(html.contains("<h1>Links for demo</h1>"));
         assert!(html.contains("demo-1.0.whl</a><br/>"));
+    }
+
+    #[test]
+    fn renders_project_json_with_empty_hashes_when_digest_is_unknown() {
+        let links = vec![CachedLink {
+            filename: "demo-1.0.whl".to_string(),
+            upstream_url: "https://files.example/demo-1.0.whl".to_string(),
+            blob_kind: "url".to_string(),
+            blob_id: "demo-1.0.whl".to_string(),
+            requires_python: None,
+            yanked: None,
+            gpg_sig: None,
+            dist_info_metadata: None,
+            core_metadata: None,
+            hash_name: None,
+            hash_value: None,
+        }];
+
+        let body = render_project_json("demo", &links);
+        let json: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(json["files"][0]["hashes"], json!({}));
     }
 }
