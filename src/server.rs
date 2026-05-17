@@ -748,6 +748,10 @@ fn metadata_hash(value: &str) -> Option<(String, String)> {
     Some((name.to_string(), hash.to_string()))
 }
 
+fn is_sha256_hash_name(hash_name: Option<&str>) -> bool {
+    hash_name.is_some_and(|hash_name| hash_name.eq_ignore_ascii_case("sha256"))
+}
+
 async fn ensure_link_blob(
     state: &AppState,
     link: CachedLink,
@@ -809,7 +813,7 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let initial_content_type = from_path(filename).first_or_octet_stream().to_string();
-    let can_resume = link.hash_name.as_deref() == Some("sha256");
+    let can_resume = is_sha256_hash_name(link.hash_name.as_deref());
     let resume_from = if can_resume {
         state
             .cache
@@ -1013,7 +1017,7 @@ fn tail_file_stream(
         (active, rx, None::<File>, 0_u64),
         |(active, mut rx, mut file, mut offset)| async move {
             loop {
-                if let Some(message) = active.failure.lock().ok().and_then(|value| value.clone()) {
+                if let Some(message) = active_failure_message(&active) {
                     return Some((Err(io::Error::other(message)), (active, rx, file, offset)));
                 }
 
@@ -1032,6 +1036,12 @@ fn tail_file_stream(
                     Err(broadcast::error::TryRecvError::Empty) => {}
                     Err(broadcast::error::TryRecvError::Closed) => {
                         if active.finished.load(Ordering::SeqCst) {
+                            if let Some(message) = active_failure_message(&active) {
+                                return Some((
+                                    Err(io::Error::other(message)),
+                                    (active, rx, file, offset),
+                                ));
+                            }
                             return None;
                         }
                     }
@@ -1047,7 +1057,15 @@ fn tail_file_stream(
                             wait_for_active_progress(&active, offset).await;
                             continue;
                         }
-                        Err(err) => return Some((Err(err), (active, rx, file, offset))),
+                        Err(err) => {
+                            if let Some(message) = active_failure_message(&active) {
+                                return Some((
+                                    Err(io::Error::other(message)),
+                                    (active, rx, file, offset),
+                                ));
+                            }
+                            return Some((Err(err), (active, rx, file, offset)));
+                        }
                     }
                 }
 
@@ -1060,7 +1078,15 @@ fn tail_file_stream(
                             wait_for_active_progress(&active, offset).await;
                             continue;
                         }
-                        Ok(0) => return None,
+                        Ok(0) => {
+                            if let Some(message) = active_failure_message(&active) {
+                                return Some((
+                                    Err(io::Error::other(message)),
+                                    (active, rx, file, offset),
+                                ));
+                            }
+                            return None;
+                        }
                         Ok(read) => {
                             buffer.truncate(read);
                             offset += read as u64;
@@ -1073,12 +1099,21 @@ fn tail_file_stream(
                 let content_length = active.content_length.load(Ordering::SeqCst);
                 if content_length > 0 && offset >= content_length {
                     if active.finished.load(Ordering::SeqCst) {
+                        if let Some(message) = active_failure_message(&active) {
+                            return Some((
+                                Err(io::Error::other(message)),
+                                (active, rx, file, offset),
+                            ));
+                        }
                         return None;
                     }
                     active.notify.notified().await;
                     continue;
                 }
                 if active.finished.load(Ordering::SeqCst) {
+                    if let Some(message) = active_failure_message(&active) {
+                        return Some((Err(io::Error::other(message)), (active, rx, file, offset)));
+                    }
                     return None;
                 }
                 tokio::select! {
@@ -1096,6 +1131,12 @@ fn tail_file_stream(
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => {
                                 if active.finished.load(Ordering::SeqCst) {
+                                    if let Some(message) = active_failure_message(&active) {
+                                        return Some((
+                                            Err(io::Error::other(message)),
+                                            (active, rx, file, offset),
+                                        ));
+                                    }
                                     return None;
                                 }
                             }
@@ -1103,6 +1144,12 @@ fn tail_file_stream(
                     }
                     _ = active.notify.notified() => {
                         if active.finished.load(Ordering::SeqCst) {
+                            if let Some(message) = active_failure_message(&active) {
+                                return Some((
+                                    Err(io::Error::other(message)),
+                                    (active, rx, file, offset),
+                                ));
+                            }
                             return None;
                         }
                     }
@@ -1110,6 +1157,10 @@ fn tail_file_stream(
             }
         },
     )
+}
+
+fn active_failure_message(active: &ActiveBlob) -> Option<String> {
+    active.failure.lock().ok().and_then(|value| value.clone())
 }
 
 enum ChunkRead {
@@ -1199,7 +1250,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     job.cache.prepare_blob_parent(&job.storage_relpath).await?;
     let mut resume_from = job.resume_from;
     let temp_path = job.cache.blob_temp_path(&job.storage_relpath);
-    let verify_sha256 = job.link.hash_name.as_deref() == Some("sha256");
+    let verify_sha256 = is_sha256_hash_name(job.link.hash_name.as_deref());
     let mut hasher = verify_sha256.then(Sha256::new);
     if resume_from > 0
         && let Some(hasher) = &mut hasher
@@ -1578,6 +1629,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sha256_hash_name_matching_is_case_insensitive() {
+        assert!(is_sha256_hash_name(Some("sha256")));
+        assert!(is_sha256_hash_name(Some("SHA256")));
+        assert!(is_sha256_hash_name(Some("Sha256")));
+        assert!(!is_sha256_hash_name(Some("sha512")));
+        assert!(!is_sha256_hash_name(None));
+    }
+
     fn test_state(cache: CacheStore, upstream_base_url: &str) -> AppState {
         AppState {
             cache,
@@ -1761,6 +1821,67 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    fn test_active_blob(temp: &tempfile::TempDir) -> Arc<ActiveBlob> {
+        Arc::new(ActiveBlob {
+            temp_path: temp.path().join("blob.tmp"),
+            final_path: temp.path().join("blob"),
+            content_type: "application/octet-stream".to_string(),
+            content_length: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            finished: AtomicBool::new(false),
+            notify: Notify::new(),
+            chunk_tx: broadcast::channel(BLOB_BROADCAST_CHANNEL_CAPACITY).0,
+            failure: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn fail_active_blob(active: &ActiveBlob, message: &str) {
+        *active.failure.lock().unwrap() = Some(message.to_string());
+        active.finished.store(true, Ordering::SeqCst);
+        active.notify.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn active_blob_stream_reports_failure_while_waiting_for_file_progress() {
+        let temp = tempdir().unwrap();
+        let active = test_active_blob(&temp);
+        let rx = active.chunk_tx.subscribe();
+        let mut stream = Box::pin(tail_file_stream(active.clone(), rx));
+        let next_chunk = tokio::spawn(async move { stream.next().await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fail_active_blob(&active, "download failed");
+
+        let item = tokio::time::timeout(Duration::from_secs(1), next_chunk)
+            .await
+            .expect("stream did not wake after failure")
+            .unwrap()
+            .expect("stream ended without reporting failure");
+        let err = item.expect_err("stream item should be an error");
+        assert_eq!(err.to_string(), "download failed");
+    }
+
+    #[tokio::test]
+    async fn active_blob_stream_reports_failure_while_waiting_for_chunk_or_notify() {
+        let temp = tempdir().unwrap();
+        let active = test_active_blob(&temp);
+        tokio::fs::write(&active.temp_path, b"").await.unwrap();
+        let rx = active.chunk_tx.subscribe();
+        let mut stream = Box::pin(tail_file_stream(active.clone(), rx));
+        let next_chunk = tokio::spawn(async move { stream.next().await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fail_active_blob(&active, "download failed");
+
+        let item = tokio::time::timeout(Duration::from_secs(1), next_chunk)
+            .await
+            .expect("stream did not wake after failure")
+            .unwrap()
+            .expect("stream ended without reporting failure");
+        let err = item.expect_err("stream item should be an error");
+        assert_eq!(err.to_string(), "download failed");
     }
 
     #[tokio::test]
