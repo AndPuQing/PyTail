@@ -70,6 +70,7 @@ resolution as long as:
 cargo run -- \
   --bind 127.0.0.1:3141 \
   --upstream-base-url https://pypi.org \
+  --torch-url https://download.pytorch.org/whl/ \
   --cache-dir .cache/pytail
 ```
 
@@ -91,6 +92,21 @@ can use the local caching endpoint instead:
 
 ```sh
 pip install torch --index-url http://127.0.0.1:3141/pytorch-wheels/cu126
+```
+
+The local path is mapped directly under the configured PyTorch wheels upstream:
+
+```text
+/pytorch-wheels/torch/        -> <torch-url>/torch/
+/pytorch-wheels/cu126/torch/  -> <torch-url>/cu126/torch/
+```
+
+For packages that need both PyPI and PyTorch wheels, keep the indexes separate:
+
+```sh
+pip install torch \
+  --index-url http://127.0.0.1:3141/pytorch-wheels/cu126 \
+  --extra-index-url http://127.0.0.1:3141/simple/
 ```
 
 ## Configuration
@@ -143,6 +159,8 @@ The wheel installs the `pytail` command as a native Rust binary.
   hashed files in the same shape as devpi's filesystem layout
 - `+files/root/pypi/+f/_url/<url-digest>/<filename>` is used only when an
   upstream file link does not provide a usable `sha256` hash
+- PyTorch wheel endpoints reuse the same blob store and download pipeline; only
+  their project cache keys and client-facing file URLs are namespaced
 
 ## Non-Goals
 
