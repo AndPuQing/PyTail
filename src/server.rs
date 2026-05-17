@@ -240,7 +240,7 @@ async fn package_file(
 }
 
 enum ProjectState {
-    Ready(HotProject, bool),
+    Ready(Box<HotProject>, bool),
     Missing,
 }
 
@@ -248,7 +248,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     if let Some(hot_project) = state.hot_projects.read().await.get(project).cloned()
         && state.cache.project_is_fresh(&hot_project.cache)
     {
-        return Ok(ProjectState::Ready(hot_project, false));
+        return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
 
     if let Some(cached) = state
@@ -260,7 +260,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     {
         let hot_project = build_hot_project(project, cached);
         cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(hot_project, false));
+        return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
 
     let _guard = state.locks.project_guard(project).await;
@@ -274,7 +274,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     {
         let hot_project = build_hot_project(project, project_cache.clone());
         cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(hot_project, false));
+        return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
 
     let etag = cached
@@ -330,7 +330,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let hot_project = build_hot_project(project, cached);
             cache_hot_project(state, project, hot_project.clone()).await;
-            Ok(ProjectState::Ready(hot_project, false))
+            Ok(ProjectState::Ready(Box::new(hot_project), false))
         }
         Ok(ProjectFetch::NotModified) => {
             if let Some(mut cached_value) = cached.clone() {
@@ -348,7 +348,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 let hot_project = build_hot_project(project, cached_value);
                 cache_hot_project(state, project, hot_project.clone()).await;
-                Ok(ProjectState::Ready(hot_project, false))
+                Ok(ProjectState::Ready(Box::new(hot_project), false))
             } else {
                 Err(StatusCode::BAD_GATEWAY)
             }
@@ -362,7 +362,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
             if let Some(cached) = cached {
                 let hot_project = build_hot_project(project, cached);
                 cache_hot_project(state, project, hot_project.clone()).await;
-                Ok(ProjectState::Ready(hot_project, true))
+                Ok(ProjectState::Ready(Box::new(hot_project), true))
             } else {
                 Err(status)
             }
@@ -1083,10 +1083,10 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     let temp_path = job.cache.blob_temp_path(&job.storage_relpath);
     let verify_sha256 = job.link.hash_name.as_deref() == Some("sha256");
     let mut hasher = verify_sha256.then(Sha256::new);
-    if resume_from > 0 {
-        if let Some(hasher) = &mut hasher {
-            hash_existing_prefix(&temp_path, hasher).await?;
-        }
+    if resume_from > 0
+        && let Some(hasher) = &mut hasher
+    {
+        hash_existing_prefix(&temp_path, hasher).await?;
     }
 
     let mut upstream_file = job

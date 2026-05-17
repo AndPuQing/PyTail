@@ -1055,7 +1055,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
- "tower-http",
  "url",
 ]
 

@@ -39,7 +39,6 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = "0.6"
 url = "2"
 
 [dev-dependencies]
