@@ -200,16 +200,16 @@ fn metadata_from_json(value: Value) -> Option<String> {
 
 pub fn render_root_html(projects: &[String]) -> String {
     let mut html = String::from(
-        "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"></head><body>\n",
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>Simple Index</title>\n  </head>\n  <body>\n",
     );
     for project in projects {
-        html.push_str("<a href=\"/simple/");
-        html.push_str(project);
+        html.push_str("    <a href=\"");
+        html.push_str(&escape_html_attr(project));
         html.push_str("/\">");
         html.push_str(&escape_html(project));
-        html.push_str("</a>\n");
+        html.push_str("</a><br/>\n");
     }
-    html.push_str("</body></html>\n");
+    html.push_str("  </body>\n</html>\n");
     html
 }
 
@@ -240,10 +240,14 @@ pub fn render_project_html_with_file_base(
     file_base_path: &str,
 ) -> String {
     let mut html = String::from(
-        "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"></head><body>\n",
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>Links for ",
     );
+    html.push_str(&escape_html(project));
+    html.push_str("</title>\n  </head>\n  <body>\n    <h1>Links for ");
+    html.push_str(&escape_html(project));
+    html.push_str("</h1>\n");
     for link in links {
-        html.push_str("<a href=\"");
+        html.push_str("    <a href=\"");
         html.push_str(&escape_html_attr(&local_file_url_with_base(
             project,
             link,
@@ -286,9 +290,9 @@ pub fn render_project_html_with_file_base(
         }
         html.push('>');
         html.push_str(&escape_html(&link.filename));
-        html.push_str("</a>\n");
+        html.push_str("</a><br/>\n");
     }
-    html.push_str("</body></html>\n");
+    html.push_str("  </body>\n</html>\n");
     html
 }
 
@@ -500,5 +504,40 @@ mod tests {
             links[0].dist_info_metadata.as_deref(),
             Some("sha256=metaabcd")
         );
+    }
+
+    #[test]
+    fn renders_root_html_like_simple_index_listing() {
+        let html = render_root_html(&["demo".to_string(), "my_pkg".to_string()]);
+
+        assert!(html.contains("<title>Simple Index</title>"));
+        assert!(html.contains("<a href=\"demo/\">demo</a><br/>"));
+        assert!(html.contains("<a href=\"my_pkg/\">my_pkg</a><br/>"));
+        assert!(!html.contains("href=\"/simple/demo/\""));
+    }
+
+    #[test]
+    fn renders_project_html_as_line_separated_link_listing() {
+        let links = vec![CachedLink {
+            filename: "demo-1.0.whl".to_string(),
+            upstream_url: "https://files.example/demo-1.0.whl".to_string(),
+            blob_kind: "sha256".to_string(),
+            blob_id: "abcd000000000000000000000000000000000000000000000000000000000000".to_string(),
+            requires_python: None,
+            yanked: None,
+            gpg_sig: None,
+            dist_info_metadata: None,
+            core_metadata: None,
+            hash_name: Some("sha256".to_string()),
+            hash_value: Some(
+                "abcd000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
+        }];
+
+        let html = render_project_html("demo", &links);
+
+        assert!(html.contains("<title>Links for demo</title>"));
+        assert!(html.contains("<h1>Links for demo</h1>"));
+        assert!(html.contains("demo-1.0.whl</a><br/>"));
     }
 }
