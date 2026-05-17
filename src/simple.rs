@@ -26,6 +26,25 @@ pub struct ParsedLink {
     pub hash_value: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootStats {
+    pub cached_size_bytes: u64,
+    pub cached_file_count: u64,
+    pub package_count: u64,
+    pub project_hits: u64,
+    pub project_misses: u64,
+    pub blob_hits: u64,
+    pub blob_misses: u64,
+    pub history: Vec<RootHistorySample>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RootHistorySample {
+    pub cached_size_bytes: u64,
+    pub package_count: u64,
+    pub hit_rate_percent: f64,
+}
+
 pub fn normalize_project_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
     let mut last_dash = false;
@@ -198,9 +217,9 @@ fn metadata_from_json(value: Value) -> Option<String> {
     }
 }
 
-pub fn render_root_html(projects: &[ProjectSummary]) -> String {
+pub fn render_root_html(projects: &[ProjectSummary], stats: RootStats) -> String {
     let mut html = String::from(
-        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>devpi</title>\n",
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>pytail</title>\n",
     );
     push_ui_head(&mut html);
     html.push_str("  </head>\n  <body>\n");
@@ -209,6 +228,8 @@ pub fn render_root_html(projects: &[ProjectSummary]) -> String {
     html.push_str(
         "      <main id=\"content\" class=\"content\">\n        <h1 class=\"page-title\">root/pypi</h1>\n        <p class=\"subtitle\">Cached packages in root/pypi</p>\n        <p class=\"notice\">Package sizes count files already downloaded into the local cache.</p>\n",
     );
+    push_root_stats(&mut html, &stats);
+    push_root_trends(&mut html, &stats);
     if projects.is_empty() {
         html.push_str("        <div class=\"empty-state\">No cached projects yet. Search for a package name to fetch it from upstream.</div>\n");
     } else {
@@ -232,6 +253,134 @@ pub fn render_root_html(projects: &[ProjectSummary]) -> String {
     push_footer(&mut html);
     html.push_str("    </div>\n  </body>\n</html>\n");
     html
+}
+
+fn push_root_stats(html: &mut String, stats: &RootStats) {
+    html.push_str("        <section class=\"stats-grid\" aria-label=\"Cache stats\">\n");
+    push_stat(html, "Cache size", &format_size(stats.cached_size_bytes));
+    push_stat(html, "Files cached", &stats.cached_file_count.to_string());
+    push_stat(
+        html,
+        "Project hit rate",
+        &format_hit_rate(stats.project_hits, stats.project_misses),
+    );
+    push_stat(
+        html,
+        "File hit rate",
+        &format_hit_rate(stats.blob_hits, stats.blob_misses),
+    );
+    html.push_str("        </section>\n");
+}
+
+fn push_root_trends(html: &mut String, stats: &RootStats) {
+    if stats.history.is_empty() {
+        return;
+    }
+    let cache_values = stats
+        .history
+        .iter()
+        .map(|sample| sample.cached_size_bytes as f64)
+        .collect::<Vec<_>>();
+    let package_values = stats
+        .history
+        .iter()
+        .map(|sample| sample.package_count as f64)
+        .collect::<Vec<_>>();
+    let hit_rate_values = stats
+        .history
+        .iter()
+        .map(|sample| sample.hit_rate_percent)
+        .collect::<Vec<_>>();
+
+    html.push_str("        <section class=\"trend-grid\" aria-label=\"Cache trends\">\n");
+    push_trend_card(
+        html,
+        "Hit rate",
+        &format!("{:.1}%", combined_hit_rate(stats)),
+        &hit_rate_values,
+    );
+    push_trend_card(
+        html,
+        "Cache size",
+        &format_size(stats.cached_size_bytes),
+        &cache_values,
+    );
+    push_trend_card(
+        html,
+        "Packages",
+        &stats.package_count.to_string(),
+        &package_values,
+    );
+    html.push_str("        </section>\n");
+}
+
+fn push_trend_card(html: &mut String, label: &str, value: &str, values: &[f64]) {
+    html.push_str("          <div class=\"trend-card\"><div class=\"trend-head\"><span class=\"trend-label\">");
+    html.push_str(&escape_html(label));
+    html.push_str("</span><strong class=\"trend-value\">");
+    html.push_str(&escape_html(value));
+    html.push_str(
+        "</strong></div><svg class=\"sparkline\" viewBox=\"0 0 100 40\" role=\"img\" aria-label=\"",
+    );
+    html.push_str(&escape_html_attr(label));
+    html.push_str(" trend\" preserveAspectRatio=\"none\"><polyline points=\"");
+    html.push_str(&sparkline_points(values));
+    html.push_str("\" /></svg></div>\n");
+}
+
+fn sparkline_points(values: &[f64]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    if values.len() == 1 {
+        return "0,20 100,20".to_string();
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(1.0);
+    let width = 100.0;
+    let height = 32.0;
+    let top = 4.0;
+    let last = values.len() - 1;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let x = index as f64 * width / last as f64;
+            let y = top + height - ((*value - min) / range * height);
+            format!("{x:.1},{y:.1}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_stat(html: &mut String, label: &str, value: &str) {
+    html.push_str("          <div class=\"stat-item\"><span class=\"stat-label\">");
+    html.push_str(&escape_html(label));
+    html.push_str("</span><strong class=\"stat-value\">");
+    html.push_str(&escape_html(value));
+    html.push_str("</strong></div>\n");
+}
+
+fn combined_hit_rate(stats: &RootStats) -> f64 {
+    let hits = stats.project_hits + stats.blob_hits;
+    let misses = stats.project_misses + stats.blob_misses;
+    let total = hits + misses;
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 * 100.0 / total as f64
+    }
+}
+
+fn format_hit_rate(hits: u64, misses: u64) -> String {
+    let total = hits + misses;
+    if total == 0 {
+        "0.0%".to_string()
+    } else {
+        format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+    }
 }
 
 pub fn render_root_json(projects: &[String]) -> String {
@@ -520,7 +669,7 @@ fn push_ui_head(html: &mut String) {
 }
 
 fn push_header(html: &mut String, breadcrumbs: &[(&str, &str)]) {
-    html.push_str("      <header class=\"topbar\">\n        <div class=\"search-row\">\n          <a class=\"brand\" href=\"/simple/\">devpi</a>\n          <form id=\"search\" class=\"search-form\" action=\"/simple/\" method=\"get\">\n            <input class=\"search-input\" type=\"text\" name=\"q\" placeholder=\"package name\" autocomplete=\"off\">\n            <input class=\"search-button\" type=\"submit\" value=\"Search\">\n          </form>\n        </div>\n        <nav class=\"breadcrumbs\">\n");
+    html.push_str("      <header class=\"topbar\">\n        <div class=\"search-row\">\n          <a class=\"brand\" href=\"/simple/\">pytail</a>\n          <form id=\"search\" class=\"search-form\" action=\"/simple/\" method=\"get\">\n            <input class=\"search-input\" type=\"text\" name=\"q\" placeholder=\"package name\" autocomplete=\"off\">\n            <input class=\"search-button\" type=\"submit\" value=\"Search\">\n          </form>\n        </div>\n        <nav class=\"breadcrumbs\">\n");
     for (label, href) in breadcrumbs {
         html.push_str("          <a href=\"");
         html.push_str(&escape_html_attr(href));
@@ -644,26 +793,58 @@ mod tests {
 
     #[test]
     fn renders_root_html_like_simple_index_listing() {
-        let html = render_root_html(&[
-            ProjectSummary {
-                project: "demo".to_string(),
-                file_count: 2,
-                cached_file_count: 1,
-                cached_size_bytes: 2048,
+        let html = render_root_html(
+            &[
+                ProjectSummary {
+                    project: "demo".to_string(),
+                    file_count: 2,
+                    cached_file_count: 1,
+                    cached_size_bytes: 2048,
+                },
+                ProjectSummary {
+                    project: "my_pkg".to_string(),
+                    file_count: 0,
+                    cached_file_count: 0,
+                    cached_size_bytes: 0,
+                },
+            ],
+            RootStats {
+                cached_size_bytes: 4096,
+                cached_file_count: 2,
+                package_count: 2,
+                project_hits: 3,
+                project_misses: 1,
+                blob_hits: 7,
+                blob_misses: 3,
+                history: vec![
+                    RootHistorySample {
+                        cached_size_bytes: 1024,
+                        package_count: 1,
+                        hit_rate_percent: 50.0,
+                    },
+                    RootHistorySample {
+                        cached_size_bytes: 4096,
+                        package_count: 2,
+                        hit_rate_percent: 70.0,
+                    },
+                ],
             },
-            ProjectSummary {
-                project: "my_pkg".to_string(),
-                file_count: 0,
-                cached_file_count: 0,
-                cached_size_bytes: 0,
-            },
-        ]);
+        );
 
-        assert!(html.contains("<title>devpi</title>"));
+        assert!(html.contains("<title>pytail</title>"));
+        assert!(html.contains("<a class=\"brand\" href=\"/simple/\">pytail</a>"));
         assert!(html.contains("<style>"));
         assert!(html.contains("<script>"));
         assert!(html.contains("<form id=\"search\" class=\"search-form\""));
         assert!(html.contains("<h1 class=\"page-title\">root/pypi</h1>"));
+        assert!(html.contains("<span class=\"stat-label\">Cache size</span>"));
+        assert!(html.contains("<strong class=\"stat-value\">4.0 KB</strong>"));
+        assert!(html.contains("<strong class=\"stat-value\">75.0%</strong>"));
+        assert!(html.contains("<strong class=\"stat-value\">70.0%</strong>"));
+        assert!(html.contains("<span class=\"trend-label\">Hit rate</span>"));
+        assert!(html.contains("<span class=\"trend-label\">Cache size</span>"));
+        assert!(html.contains("<span class=\"trend-label\">Packages</span>"));
+        assert!(html.contains("<polyline points=\""));
         assert!(html.contains("<a class=\"project-link\" href=\"demo/\">demo"));
         assert!(html.contains("1/2 files cached"));
         assert!(html.contains("2.0 KB"));

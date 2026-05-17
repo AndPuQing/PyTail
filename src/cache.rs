@@ -34,6 +34,13 @@ pub struct ProjectSummary {
     pub cached_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSummary {
+    pub project_count: u64,
+    pub ready_blob_count: u64,
+    pub cached_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectCache {
     pub project: String,
@@ -184,6 +191,32 @@ impl CacheStore {
                 projects.push(row.map_err(sqlite_error)?);
             }
             Ok(projects)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn cache_summary(&self) -> io::Result<CacheSummary> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM projects),
+                    COUNT(*),
+                    COALESCE(SUM(size_bytes), 0)
+                 FROM blobs
+                 WHERE state = 'ready'",
+                [],
+                |row| {
+                    Ok(CacheSummary {
+                        project_count: row.get(0)?,
+                        ready_blob_count: row.get(1)?,
+                        cached_size_bytes: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(sqlite_error)
         })
         .await
         .map_err(join_error)?
@@ -897,6 +930,11 @@ mod tests {
         assert_eq!(summaries[0].file_count, 1);
         assert_eq!(summaries[0].cached_file_count, 1);
         assert_eq!(summaries[0].cached_size_bytes, 1234);
+
+        let summary = cache.cache_summary().await.unwrap();
+        assert_eq!(summary.project_count, 1);
+        assert_eq!(summary.ready_blob_count, 1);
+        assert_eq!(summary.cached_size_bytes, 1234);
     }
 
     #[tokio::test]

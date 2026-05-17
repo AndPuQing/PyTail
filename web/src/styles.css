@@ -83,6 +83,55 @@
     @apply mt-4 border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950;
   }
 
+  .stats-grid {
+    @apply mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4;
+  }
+
+  .stat-item {
+    @apply rounded border border-slate-200 bg-white px-3 py-2 shadow-sm;
+  }
+
+  .stat-label {
+    @apply block text-xs font-medium uppercase text-slate-500;
+  }
+
+  .stat-value {
+    @apply mt-1 block text-lg font-semibold text-slate-950;
+  }
+
+  .trend-grid {
+    @apply mt-3 grid gap-2 lg:grid-cols-3;
+  }
+
+  .trend-card {
+    @apply rounded border border-slate-200 bg-white px-3 py-2 shadow-sm;
+  }
+
+  .trend-head {
+    @apply flex items-baseline justify-between gap-3;
+  }
+
+  .trend-label {
+    @apply text-xs font-medium uppercase text-slate-500;
+  }
+
+  .trend-value {
+    @apply text-sm font-semibold text-slate-950;
+  }
+
+  .sparkline {
+    @apply mt-2 block h-12 w-full overflow-visible;
+  }
+
+  .sparkline polyline {
+    fill: none;
+    stroke: #0284c7;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+  }
+
   .project-grid {
     @apply mt-5 grid gap-2 sm:grid-cols-2 lg:grid-cols-3;
   }
