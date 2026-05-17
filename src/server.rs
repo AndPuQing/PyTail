@@ -37,6 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -67,6 +68,7 @@ const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
 const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
 const ROOT_STATS_HISTORY_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+const FILE_STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const PYPI_FILE_BASE_PATH: &str = "/root/pypi/+f";
 const PYTORCH_WHEELS_FILE_BASE_PATH: &str = "/pytorch-wheels/+f";
 
@@ -368,7 +370,41 @@ fn app(state: AppState) -> Router {
             "/pytorch-wheels/{channel}/{plusf}/{route_a}/{route_b}/{filename}",
             get(pytorch_wheels_channel_package_file),
         )
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(should_compress_simple_response),
+        )
         .with_state(Arc::new(state))
+}
+
+fn should_compress_simple_response(
+    status: StatusCode,
+    _version: axum::http::Version,
+    headers: &HeaderMap,
+    _extensions: &axum::http::Extensions,
+) -> bool {
+    if status != StatusCode::OK {
+        return false;
+    }
+    let Some(content_length) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    if content_length < 64 * 1024 {
+        return false;
+    }
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type.starts_with("text/html")
+                || content_type.starts_with(json_media_type())
+                || content_type.starts_with("application/json")
+        })
 }
 
 async fn root_redirect() -> impl IntoResponse {
@@ -1113,7 +1149,9 @@ async fn cached_file_response(
                     );
                 }
                 let length = range.end - range.start + 1;
-                let stream = ReaderStream::new(file.take(length)).map_err(io::Error::other);
+                let stream =
+                    ReaderStream::with_capacity(file.take(length), FILE_STREAM_BUFFER_SIZE)
+                        .map_err(io::Error::other);
                 let mut response = Response::new(Body::from_stream(stream));
                 *response.status_mut() = StatusCode::PARTIAL_CONTENT;
                 response
@@ -1136,7 +1174,8 @@ async fn cached_file_response(
                 return response;
             }
 
-            let stream = ReaderStream::new(file).map_err(io::Error::other);
+            let stream = ReaderStream::with_capacity(file, FILE_STREAM_BUFFER_SIZE)
+                .map_err(io::Error::other);
             let mut response = Response::new(Body::from_stream(stream));
             *response.status_mut() = StatusCode::OK;
             response
