@@ -29,6 +29,8 @@ pub struct CachedLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSummary {
     pub project: String,
+    pub display_name: String,
+    pub page_url: String,
     pub file_count: u64,
     pub cached_file_count: u64,
     pub cached_size_bytes: u64,
@@ -153,6 +155,7 @@ impl CacheStore {
                 .prepare(
                     "SELECT
                         p.project,
+                        p.upstream_project_url,
                         COUNT(pl.position) AS file_count,
                         COALESCE((
                             SELECT COUNT(*)
@@ -180,17 +183,23 @@ impl CacheStore {
                         ), 0) AS cached_size_bytes
                      FROM projects p
                      LEFT JOIN project_links pl ON pl.project = p.project
-                     GROUP BY p.project
+                     GROUP BY p.project, p.upstream_project_url
                      ORDER BY p.project",
                 )
                 .map_err(sqlite_error)?;
             let rows = stmt
                 .query_map([], |row| {
+                    let project = row.get::<_, String>(0)?;
+                    let upstream_project_url = row.get::<_, String>(1)?;
+                    let (display_name, page_url) =
+                        project_summary_link(&project, &upstream_project_url);
                     Ok(ProjectSummary {
-                        project: row.get(0)?,
-                        file_count: row.get(1)?,
-                        cached_file_count: row.get(2)?,
-                        cached_size_bytes: row.get(3)?,
+                        project,
+                        display_name,
+                        page_url,
+                        file_count: row.get(2)?,
+                        cached_file_count: row.get(3)?,
+                        cached_size_bytes: row.get(4)?,
                     })
                 })
                 .map_err(sqlite_error)?;
@@ -563,6 +572,33 @@ pub fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn project_summary_link(project: &str, upstream_project_url: &str) -> (String, String) {
+    let Some(rest) = project.strip_prefix("pytorch-wheels-") else {
+        return (project.to_string(), format!("{project}/"));
+    };
+    let upstream_project = upstream_project_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(rest);
+    if rest == upstream_project {
+        return (
+            upstream_project.to_string(),
+            format!("/pytorch-wheels/{upstream_project}/"),
+        );
+    }
+    if let Some(channel) = rest.strip_suffix(&format!("-{upstream_project}"))
+        && !channel.is_empty()
+    {
+        return (
+            upstream_project.to_string(),
+            format!("/pytorch-wheels/{channel}/{upstream_project}/"),
+        );
+    }
+    (project.to_string(), format!("{project}/"))
 }
 
 pub fn fallback_blob_identity(upstream_url: &str) -> (String, String) {
@@ -1015,6 +1051,8 @@ mod tests {
         let summaries = cache.list_project_summaries().await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].project, "requests");
+        assert_eq!(summaries[0].display_name, "requests");
+        assert_eq!(summaries[0].page_url, "requests/");
         assert_eq!(summaries[0].file_count, 1);
         assert_eq!(summaries[0].cached_file_count, 1);
         assert_eq!(summaries[0].cached_size_bytes, 1234);
@@ -1023,6 +1061,33 @@ mod tests {
         assert_eq!(summary.project_count, 1);
         assert_eq!(summary.ready_blob_count, 1);
         assert_eq!(summary.cached_size_bytes, 1234);
+    }
+
+    #[tokio::test]
+    async fn project_summaries_link_pytorch_wheel_cache_entries_to_wheel_routes() {
+        let temp = tempdir().unwrap();
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        cache
+            .store_project(&ProjectRecord {
+                project: "pytorch-wheels-cu126-setuptools".to_string(),
+                fetched_at: 1,
+                expires_at: 10,
+                upstream_etag: None,
+                upstream_serial: None,
+                upstream_project_url: "https://download.pytorch.org/whl/cu126/setuptools/"
+                    .to_string(),
+                raw_body: "<html></html>".to_string(),
+                links: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let summaries = cache.list_project_summaries().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].project, "pytorch-wheels-cu126-setuptools");
+        assert_eq!(summaries[0].display_name, "setuptools");
+        assert_eq!(summaries[0].page_url, "/pytorch-wheels/cu126/setuptools/");
     }
 
     #[tokio::test]

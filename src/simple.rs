@@ -229,9 +229,9 @@ pub fn render_root_html(projects: &[ProjectSummary], stats: RootStats) -> String
         html.push_str("        <div class=\"project-grid\">\n");
         for project in projects {
             html.push_str("          <a class=\"project-link\" href=\"");
-            html.push_str(&escape_html_attr(&project.project));
-            html.push_str("/\">");
-            html.push_str(&escape_html(&project.project));
+            html.push_str(&escape_html_attr(&project.page_url));
+            html.push_str("\">");
+            html.push_str(&escape_html(&project.display_name));
             html.push_str("<span class=\"project-stats\">");
             html.push_str(&project.cached_file_count.to_string());
             html.push('/');
@@ -810,12 +810,16 @@ mod tests {
             &[
                 ProjectSummary {
                     project: "demo".to_string(),
+                    display_name: "demo".to_string(),
+                    page_url: "demo/".to_string(),
                     file_count: 2,
                     cached_file_count: 1,
                     cached_size_bytes: 2048,
                 },
                 ProjectSummary {
                     project: "my_pkg".to_string(),
+                    display_name: "my_pkg".to_string(),
+                    page_url: "my_pkg/".to_string(),
                     file_count: 0,
                     cached_file_count: 0,
                     cached_size_bytes: 0,
