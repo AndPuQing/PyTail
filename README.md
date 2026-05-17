@@ -1,5 +1,10 @@
 # PyTail
 
+[![CI](https://img.shields.io/github/actions/workflow/status/AndPuQing/PyTail/ci.yml?branch=main&label=CI)](https://github.com/AndPuQing/PyTail/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/actions/workflow/status/AndPuQing/PyTail/release.yml?label=Release)](https://github.com/AndPuQing/PyTail/actions/workflows/release.yml)
+[![PyPI](https://img.shields.io/pypi/v/pytail.svg)](https://pypi.org/project/pytail/)
+[![Python](https://img.shields.io/pypi/pyversions/pytail.svg)](https://pypi.org/project/pytail/)
+
 `pytail` is a minimal incremental PyPI caching mirror.
 
 It is no longer a `devpi` clone. The new server only does four things:
