@@ -5,6 +5,7 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use devpi_rs::config::AppConfig;
@@ -54,6 +55,7 @@ enum Mode {
     Slow,
     Late,
     SlowClient,
+    Paths,
     Both,
     All,
 }
@@ -131,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
         }
+        Mode::Paths => run_path_scenarios(&args).await?,
         Mode::Both => {
             run_scenario(
                 "fast",
@@ -182,8 +185,158 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Duration::from_millis(args.slow_client_read_delay_ms)),
             )
             .await?;
+            run_path_scenarios(&args).await?;
         }
     }
+    Ok(())
+}
+
+async fn run_path_scenarios(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let wheel = Arc::new(make_wheel(args.wheel_mib * 1024 * 1024));
+    let sha256 = format!("{:x}", Sha256::digest(wheel.as_slice()));
+    let upstream = spawn_upstream(UpstreamState {
+        wheel,
+        sha256,
+        chunk_bytes: args.chunk_kib * 1024,
+        chunk_delay: Duration::ZERO,
+        file_requests: Arc::new(AtomicUsize::new(0)),
+        chunks_sent: Arc::new(AtomicUsize::new(0)),
+    })
+    .await?;
+
+    let cache_dir = args
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("devpi-rs-path-bench"));
+    let cache_dir = cache_dir.join(unique_suffix());
+    tokio::fs::create_dir_all(&cache_dir).await?;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_addr = proxy_listener.local_addr()?;
+    let proxy_task = tokio::spawn(devpi_rs::server::serve_listener(
+        AppConfig {
+            bind: proxy_addr.to_string(),
+            upstream_base_url: upstream.base_url.clone(),
+            cache_dir,
+            project_cache_ttl_secs: 3600,
+            request_timeout_secs: args.request_timeout_secs,
+        },
+        proxy_listener,
+    ));
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(args.clients.max(1))
+        .build()?;
+
+    let before_requests = upstream.file_requests.load(Ordering::SeqCst);
+    let before_chunks = upstream.chunks_sent.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let direct = download_client(
+        0,
+        client.clone(),
+        format!("{}packages/demo-1.0.whl", upstream.base_url),
+        None,
+    )
+    .await;
+    print_report(
+        "path-direct-upstream-stream",
+        args,
+        Duration::ZERO,
+        upstream.file_requests.load(Ordering::SeqCst) - before_requests,
+        upstream.chunks_sent.load(Ordering::SeqCst) - before_chunks,
+        started.elapsed(),
+        &[direct],
+    );
+
+    let before_requests = upstream.file_requests.load(Ordering::SeqCst);
+    let before_chunks = upstream.chunks_sent.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let direct_static = download_client(
+        0,
+        client.clone(),
+        format!("{}packages-static/demo-1.0.whl", upstream.base_url),
+        None,
+    )
+    .await;
+    print_report(
+        "path-direct-static",
+        args,
+        Duration::ZERO,
+        upstream.file_requests.load(Ordering::SeqCst) - before_requests,
+        upstream.chunks_sent.load(Ordering::SeqCst) - before_chunks,
+        started.elapsed(),
+        &[direct_static],
+    );
+
+    let simple_url = format!("http://{proxy_addr}/simple/demo/");
+    let html = client.get(simple_url).send().await?.text().await?;
+    let file_path = html
+        .split('"')
+        .find(|part| part.starts_with("/root/pypi/+f/"))
+        .and_then(|part| part.split('#').next())
+        .ok_or("proxy simple page did not contain a cached file link")?;
+    let file_url = format!("http://{proxy_addr}{file_path}");
+
+    let before_requests = upstream.file_requests.load(Ordering::SeqCst);
+    let before_chunks = upstream.chunks_sent.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let cold = download_client(0, client.clone(), file_url.clone(), None).await;
+    print_report(
+        "path-proxy-cold",
+        args,
+        Duration::ZERO,
+        upstream.file_requests.load(Ordering::SeqCst) - before_requests,
+        upstream.chunks_sent.load(Ordering::SeqCst) - before_chunks,
+        started.elapsed(),
+        &[cold],
+    );
+
+    let before_requests = upstream.file_requests.load(Ordering::SeqCst);
+    let before_chunks = upstream.chunks_sent.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let cached = download_client(0, client.clone(), file_url.clone(), None).await;
+    print_report(
+        "path-proxy-cached-single",
+        args,
+        Duration::ZERO,
+        upstream.file_requests.load(Ordering::SeqCst) - before_requests,
+        upstream.chunks_sent.load(Ordering::SeqCst) - before_chunks,
+        started.elapsed(),
+        &[cached],
+    );
+
+    let before_requests = upstream.file_requests.load(Ordering::SeqCst);
+    let before_chunks = upstream.chunks_sent.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let barrier = Arc::new(Barrier::new(args.clients + 1));
+    let mut handles = Vec::with_capacity(args.clients);
+    for id in 0..args.clients {
+        let client = client.clone();
+        let file_url = file_url.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            download_client(id, client, file_url, None).await
+        }));
+    }
+    barrier.wait().await;
+    let mut metrics = Vec::with_capacity(args.clients);
+    for handle in handles {
+        metrics.push(handle.await?);
+    }
+    metrics.sort_by_key(|metric| metric.id);
+    print_report(
+        "path-proxy-cached-fanout",
+        args,
+        Duration::ZERO,
+        upstream.file_requests.load(Ordering::SeqCst) - before_requests,
+        upstream.chunks_sent.load(Ordering::SeqCst) - before_chunks,
+        started.elapsed(),
+        &metrics,
+    );
+
+    proxy_task.abort();
+    upstream.task.abort();
     Ok(())
 }
 
@@ -227,7 +380,7 @@ async fn run_scenario(
     ));
 
     let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(args.clients)
+        .pool_max_idle_per_host(args.clients.max(1))
         .build()?;
     let simple_url = format!("http://{proxy_addr}/simple/demo/");
     let html = client.get(simple_url).send().await?.text().await?;
@@ -444,13 +597,19 @@ async fn spawn_upstream(state: UpstreamState) -> std::io::Result<UpstreamServer>
     let app = Router::new()
         .route("/simple/demo/", get(simple_page))
         .route("/packages/demo-1.0.whl", get(package_file))
+        .route("/packages-static/demo-1.0.whl", get(package_file_static))
         .with_state(Arc::new(state));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .map_err(std::io::Error::other)
+        axum::serve(
+            listener.tap_io(|stream| {
+                let _ = stream.set_nodelay(true);
+            }),
+            app,
+        )
+        .await
+        .map_err(std::io::Error::other)
     });
     Ok(UpstreamServer {
         base_url: format!("http://{addr}/"),
@@ -469,6 +628,16 @@ async fn simple_page(State(state): State<Arc<UpstreamState>>) -> impl IntoRespon
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(body))
+        .unwrap()
+}
+
+async fn package_file_static(State(state): State<Arc<UpstreamState>>) -> impl IntoResponse {
+    state.file_requests.fetch_add(1, Ordering::SeqCst);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_LENGTH, state.wheel.len().to_string())
+        .body(Body::from(Bytes::copy_from_slice(state.wheel.as_slice())))
         .unwrap()
 }
 

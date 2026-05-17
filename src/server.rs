@@ -4,31 +4,37 @@ use crate::cache::{
 };
 use crate::config::AppConfig;
 use crate::simple::{
-    json_media_type, normalize_project_name, parse_project_links, render_project_html,
-    render_project_json, render_root_html, render_root_json, wants_json,
+    json_media_type, normalize_project_name, parse_project_json_links, parse_project_links,
+    render_project_html, render_project_json, render_root_html, render_root_json, wants_json,
 };
-use crate::upstream::{ProjectFetch, UpstreamClient};
+use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, WARNING};
+use axum::http::header::{
+    ACCEPT, ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, RANGE,
+    WARNING,
+};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use bytes::Bytes;
+use axum::serve::ListenerExt;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
+use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use url::Url;
 
 #[derive(Clone)]
@@ -39,10 +45,29 @@ struct AppState {
     locks: RequestLocks,
     active_blobs: ActiveBlobRegistry,
     hot_projects: HotProjectCache,
+    hot_links: HotLinkCache,
+    hot_blobs: HotBlobCache,
 }
 
 type ActiveBlobRegistry = Arc<Mutex<HashMap<String, Arc<ActiveBlob>>>>;
-type HotProjectCache = Arc<RwLock<HashMap<String, ProjectCache>>>;
+type HotProjectCache = Arc<RwLock<HashMap<String, HotProject>>>;
+type HotLinkCache = Arc<RwLock<HashMap<String, CachedLink>>>;
+type HotBlobCache = Arc<RwLock<HashMap<String, BlobInfo>>>;
+type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+#[derive(Clone)]
+struct HotProject {
+    cache: ProjectCache,
+    rendered: RenderedProject,
+}
+
+#[derive(Clone)]
+struct RenderedProject {
+    html_body: String,
+    html_etag: String,
+    json_body: String,
+    json_etag: String,
+}
 
 struct ActiveBlob {
     temp_path: std::path::PathBuf,
@@ -64,8 +89,8 @@ struct BlobChunk {
 
 #[derive(Clone, Default)]
 struct RequestLocks {
-    projects: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    blobs: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    projects: RequestLockMap,
+    blobs: RequestLockMap,
 }
 
 impl RequestLocks {
@@ -78,11 +103,7 @@ impl RequestLocks {
             .await
     }
 
-    async fn guard(
-        &self,
-        map: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-        key: &str,
-    ) -> OwnedMutexGuard<()> {
+    async fn guard(&self, map: &RequestLockMap, key: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut map = map.lock().await;
             map.entry(key.to_string())
@@ -108,9 +129,18 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         locks: RequestLocks::default(),
         active_blobs: ActiveBlobRegistry::default(),
         hot_projects: HotProjectCache::default(),
+        hot_links: HotLinkCache::default(),
+        hot_blobs: HotBlobCache::default(),
     };
     let app = app(state);
-    axum::serve(listener, app).await.map_err(io::Error::other)
+    axum::serve(
+        listener.tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        }),
+        app,
+    )
+    .await
+    .map_err(io::Error::other)
 }
 
 fn app(state: AppState) -> Router {
@@ -124,7 +154,41 @@ fn app(state: AppState) -> Router {
             "/root/pypi/{plusf}/{route_a}/{route_b}/{filename}",
             get(package_file),
         )
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(should_compress_simple_response),
+        )
         .with_state(Arc::new(state))
+}
+
+fn should_compress_simple_response(
+    status: StatusCode,
+    _version: axum::http::Version,
+    headers: &HeaderMap,
+    _extensions: &axum::http::Extensions,
+) -> bool {
+    if status != StatusCode::OK {
+        return false;
+    }
+    let Some(content_length) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    if content_length < 64 * 1024 {
+        return false;
+    }
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type.starts_with("text/html")
+                || content_type.starts_with(json_media_type())
+                || content_type.starts_with("application/json")
+        })
 }
 
 async fn root_redirect() -> impl IntoResponse {
@@ -168,23 +232,22 @@ async fn simple_project(
 ) -> Response<Body> {
     let normalized = normalize_project_name(&project);
     match ensure_project(&state, &normalized).await {
-        Ok(ProjectState::Ready(cache, stale)) => {
+        Ok(ProjectState::Ready(hot_project, stale)) => {
             let format_json = wants_json(header_value(&headers, ACCEPT));
-            let body = if format_json {
-                render_project_json(&normalized, &cache.links)
+            let (content_type, body, etag) = if format_json {
+                (
+                    json_media_type(),
+                    hot_project.rendered.json_body,
+                    hot_project.rendered.json_etag,
+                )
             } else {
-                render_project_html(&normalized, &cache.links)
+                (
+                    "text/html; charset=utf-8",
+                    hot_project.rendered.html_body,
+                    hot_project.rendered.html_etag,
+                )
             };
-            render_simple_response(
-                &headers,
-                if format_json {
-                    json_media_type()
-                } else {
-                    "text/html; charset=utf-8"
-                },
-                body,
-                stale,
-            )
+            render_cached_simple_response(&headers, content_type, body, etag, stale)
         }
         Ok(ProjectState::Missing) => text_response(StatusCode::NOT_FOUND, "project not found\n"),
         Err(status) => text_response(status, "upstream unavailable\n"),
@@ -194,27 +257,33 @@ async fn simple_project(
 async fn package_file(
     State(state): State<Arc<AppState>>,
     Path((plusf, route_a, route_b, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Response<Body> {
     if plusf != "+f" {
         return text_response(StatusCode::NOT_FOUND, "file unavailable\n");
     }
-    match ensure_blob(&state, &route_a, &route_b, &filename).await {
-        Ok(BlobResponse::Ready(blob)) => cached_file_response(&state.cache, &blob).await,
+    let response = if let Some(base_filename) = filename.strip_suffix(".metadata") {
+        ensure_metadata_blob(&state, &route_a, &route_b, base_filename, &filename).await
+    } else {
+        ensure_blob(&state, &route_a, &route_b, &filename).await
+    };
+    match response {
+        Ok(BlobResponse::Ready(blob)) => cached_file_response(&state.cache, &blob, &headers).await,
         Ok(BlobResponse::Streaming(response)) => response,
         Err(status) => text_response(status, "file unavailable\n"),
     }
 }
 
 enum ProjectState {
-    Ready(ProjectCache, bool),
+    Ready(HotProject, bool),
     Missing,
 }
 
 async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState, StatusCode> {
-    if let Some(cached) = state.hot_projects.read().await.get(project).cloned()
-        && state.cache.project_is_fresh(&cached)
+    if let Some(hot_project) = state.hot_projects.read().await.get(project).cloned()
+        && state.cache.project_is_fresh(&hot_project.cache)
     {
-        return Ok(ProjectState::Ready(cached, false));
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     if let Some(cached) = state
@@ -224,12 +293,9 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         && state.cache.project_is_fresh(&cached)
     {
-        state
-            .hot_projects
-            .write()
-            .await
-            .insert(project.to_string(), cached.clone());
-        return Ok(ProjectState::Ready(cached, false));
+        let hot_project = build_hot_project(project, cached);
+        cache_hot_project(state, project, hot_project.clone()).await;
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     let _guard = state.locks.project_guard(project).await;
@@ -241,12 +307,9 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     if let Some(project_cache) = &cached
         && state.cache.project_is_fresh(project_cache)
     {
-        state
-            .hot_projects
-            .write()
-            .await
-            .insert(project.to_string(), project_cache.clone());
-        return Ok(ProjectState::Ready(project_cache.clone(), false));
+        let hot_project = build_hot_project(project, project_cache.clone());
+        cache_hot_project(state, project, hot_project.clone()).await;
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     let etag = cached
@@ -255,7 +318,11 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     let result = match state.upstream.fetch_project(project, etag).await {
         Ok(ProjectFetch::Fresh(page)) => {
             let page_url = Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
-            let parsed_links = parse_project_links(&page.body, &page_url);
+            let parsed_links = match page.format {
+                ProjectPageFormat::Json => parse_project_json_links(&page.body, &page_url)
+                    .unwrap_or_else(|_| parse_project_links(&page.body, &page_url)),
+                ProjectPageFormat::Html => parse_project_links(&page.body, &page_url),
+            };
             let links = parsed_links
                 .into_iter()
                 .map(|link| {
@@ -296,39 +363,27 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                 .store_project(&record)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            state
-                .hot_projects
-                .write()
-                .await
-                .insert(project.to_string(), cached.clone());
-            Ok(ProjectState::Ready(cached, false))
+            let hot_project = build_hot_project(project, cached);
+            cache_hot_project(state, project, hot_project.clone()).await;
+            Ok(ProjectState::Ready(hot_project, false))
         }
         Ok(ProjectFetch::NotModified) => {
             if let Some(mut cached_value) = cached.clone() {
                 let now = current_unix_secs();
                 cached_value.fetched_at = now;
                 cached_value.expires_at = now + state.project_cache_ttl_secs;
-                let record = ProjectRecord {
-                    project: cached_value.project.clone(),
-                    fetched_at: cached_value.fetched_at,
-                    expires_at: cached_value.expires_at,
-                    upstream_etag: cached_value.upstream_etag.clone(),
-                    upstream_serial: cached_value.upstream_serial,
-                    upstream_project_url: cached_value.upstream_project_url.clone(),
-                    raw_body: cached_value.raw_body.clone(),
-                    links: cached_value.links.clone(),
-                };
-                let cached = state
+                state
                     .cache
-                    .store_project(&record)
+                    .touch_project(
+                        &cached_value.project,
+                        cached_value.fetched_at,
+                        cached_value.expires_at,
+                    )
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                state
-                    .hot_projects
-                    .write()
-                    .await
-                    .insert(project.to_string(), cached.clone());
-                Ok(ProjectState::Ready(cached, false))
+                let hot_project = build_hot_project(project, cached_value);
+                cache_hot_project(state, project, hot_project.clone()).await;
+                Ok(ProjectState::Ready(hot_project, false))
             } else {
                 Err(StatusCode::BAD_GATEWAY)
             }
@@ -340,17 +395,42 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         Ok(value) => Ok(value),
         Err(status) => {
             if let Some(cached) = cached {
-                state
-                    .hot_projects
-                    .write()
-                    .await
-                    .insert(project.to_string(), cached.clone());
-                Ok(ProjectState::Ready(cached, true))
+                let hot_project = build_hot_project(project, cached);
+                cache_hot_project(state, project, hot_project.clone()).await;
+                Ok(ProjectState::Ready(hot_project, true))
             } else {
                 Err(status)
             }
         }
     }
+}
+
+fn build_hot_project(project: &str, cache: ProjectCache) -> HotProject {
+    let html_body = render_project_html(project, &cache.links);
+    let json_body = render_project_json(project, &cache.links);
+    HotProject {
+        cache,
+        rendered: RenderedProject {
+            html_etag: response_etag(html_body.as_bytes()),
+            json_etag: response_etag(json_body.as_bytes()),
+            html_body,
+            json_body,
+        },
+    }
+}
+
+async fn cache_hot_project(state: &AppState, project: &str, hot_project: HotProject) {
+    {
+        let mut hot_links = state.hot_links.write().await;
+        for link in &hot_project.cache.links {
+            hot_links.insert(route_key_for_link(link), link.clone());
+        }
+    }
+    state
+        .hot_projects
+        .write()
+        .await
+        .insert(project.to_string(), hot_project);
 }
 
 enum BlobResponse {
@@ -362,20 +442,118 @@ fn blob_key(blob_kind: &str, blob_id: &str) -> String {
     format!("{blob_kind}:{blob_id}")
 }
 
+fn route_key(route_a: &str, route_b: &str, filename: &str) -> String {
+    format!("{route_a}/{route_b}/{filename}")
+}
+
+fn route_key_for_link(link: &CachedLink) -> String {
+    if link.blob_kind == "sha256" && link.blob_id.len() >= 16 {
+        return route_key(&link.blob_id[..3], &link.blob_id[3..16], &link.filename);
+    }
+    route_key("_url", &link.blob_id, &link.filename)
+}
+
 async fn ensure_blob(
     state: &AppState,
     route_a: &str,
     route_b: &str,
     filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
-    let Some(link) = state
-        .cache
-        .find_link_by_blob(route_a, route_b, filename)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    else {
-        return Err(StatusCode::NOT_FOUND);
+    let key = route_key(route_a, route_b, filename);
+    let link = if let Some(link) = state.hot_links.read().await.get(&key).cloned() {
+        link
+    } else {
+        let Some(link) = state
+            .cache
+            .find_link_by_blob(route_a, route_b, filename)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        state.hot_links.write().await.insert(key, link.clone());
+        link
     };
+
+    ensure_link_blob(state, link, filename).await
+}
+
+async fn ensure_metadata_blob(
+    state: &AppState,
+    route_a: &str,
+    route_b: &str,
+    base_filename: &str,
+    metadata_filename: &str,
+) -> Result<BlobResponse, StatusCode> {
+    let base_key = route_key(route_a, route_b, base_filename);
+    let link = if let Some(link) = state.hot_links.read().await.get(&base_key).cloned() {
+        link
+    } else {
+        let Some(link) = state
+            .cache
+            .find_link_by_blob(route_a, route_b, base_filename)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        state.hot_links.write().await.insert(base_key, link.clone());
+        link
+    };
+    let metadata_value = link
+        .dist_info_metadata
+        .as_deref()
+        .or(link.core_metadata.as_deref());
+    if metadata_value.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let upstream_url = format!("{}.metadata", link.upstream_url);
+    let (hash_name, hash_value) = metadata_value
+        .and_then(metadata_hash)
+        .map_or((None, None), |(name, value)| (Some(name), Some(value)));
+    let (blob_kind, blob_id) = match (&hash_name, &hash_value) {
+        (Some(hash_name), Some(hash_value)) => {
+            hash_blob_identity(hash_name, hash_value, &upstream_url)
+        }
+        _ => fallback_blob_identity(&upstream_url),
+    };
+    let metadata_link = CachedLink {
+        filename: metadata_filename.to_string(),
+        upstream_url,
+        blob_kind,
+        blob_id,
+        requires_python: None,
+        yanked: None,
+        gpg_sig: None,
+        dist_info_metadata: None,
+        core_metadata: None,
+        hash_name,
+        hash_value,
+    };
+    state.hot_links.write().await.insert(
+        route_key(route_a, route_b, metadata_filename),
+        metadata_link.clone(),
+    );
+    ensure_link_blob(state, metadata_link, metadata_filename).await
+}
+
+fn metadata_hash(value: &str) -> Option<(String, String)> {
+    let (name, hash) = value.split_once('=')?;
+    if name.is_empty() || hash.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), hash.to_string()))
+}
+
+async fn ensure_link_blob(
+    state: &AppState,
+    link: CachedLink,
+    filename: &str,
+) -> Result<BlobResponse, StatusCode> {
+    let key = blob_key(&link.blob_kind, &link.blob_id);
+    if let Some(blob) = state.hot_blobs.read().await.get(&key).cloned() {
+        return Ok(BlobResponse::Ready(blob));
+    }
 
     if let BlobStatus::Ready(blob) = state
         .cache
@@ -383,6 +561,7 @@ async fn ensure_blob(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
+        state.hot_blobs.write().await.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -390,7 +569,6 @@ async fn ensure_blob(
         .cache
         .blob_storage_relpath(&link.blob_kind, &link.blob_id, filename)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let key = blob_key(&link.blob_kind, &link.blob_id);
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
         return active_blob_response(active).await;
     }
@@ -402,6 +580,7 @@ async fn ensure_blob(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
+        state.hot_blobs.write().await.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
@@ -448,24 +627,69 @@ async fn ensure_blob(
         .insert(key.clone(), active.clone());
     drop(guard);
 
+    let (leader_tx, leader_rx) = mpsc::unbounded_channel();
     tokio::spawn(download_blob_task(DownloadJob {
         cache: state.cache.clone(),
         upstream: state.upstream.clone(),
         active_blobs: state.active_blobs.clone(),
+        hot_blobs: state.hot_blobs.clone(),
         active_key: key.clone(),
         active: active.clone(),
         link,
         storage_relpath,
         initial_content_type,
         resume_from,
+        leader_tx: Some(leader_tx),
     }));
 
-    active_blob_response(active).await
+    leader_blob_response_from_rx(active, leader_rx).await
 }
 
-async fn cached_file_response(cache: &CacheStore, blob: &BlobInfo) -> Response<Body> {
+async fn cached_file_response(
+    cache: &CacheStore,
+    blob: &BlobInfo,
+    headers: &HeaderMap,
+) -> Response<Body> {
     match File::open(cache.blob_path(&blob.storage_relpath)).await {
-        Ok(file) => {
+        Ok(mut file) => {
+            let range = match header_value(headers, RANGE) {
+                Some(value) => match parse_byte_range(value, blob.size_bytes) {
+                    Ok(range) => range,
+                    Err(()) => return range_not_satisfiable_response(blob.size_bytes),
+                },
+                None => None,
+            };
+            if let Some(range) = range {
+                if file.seek(SeekFrom::Start(range.start)).await.is_err() {
+                    return text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "cache file missing\n",
+                    );
+                }
+                let length = range.end - range.start + 1;
+                let stream = ReaderStream::new(file.take(length)).map_err(io::Error::other);
+                let mut response = Response::new(Body::from_stream(stream));
+                *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, header(&blob.content_type));
+                response.headers_mut().insert(
+                    CONTENT_RANGE,
+                    header(&format!(
+                        "bytes {}-{}/{}",
+                        range.start, range.end, blob.size_bytes
+                    )),
+                );
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_LENGTH,
+                    header(&length.to_string()),
+                );
+                response
+                    .headers_mut()
+                    .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                return response;
+            }
+
             let stream = ReaderStream::new(file).map_err(io::Error::other);
             let mut response = Response::new(Body::from_stream(stream));
             *response.status_mut() = StatusCode::OK;
@@ -477,15 +701,110 @@ async fn cached_file_response(cache: &CacheStore, blob: &BlobInfo) -> Response<B
                 header(&blob.size_bytes.to_string()),
             );
             response
+                .headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response
         }
         Err(_) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "cache file missing\n"),
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+fn parse_byte_range(value: &str, size: u64) -> Result<Option<ByteRange>, ()> {
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Err(());
+    }
+
+    let (start, end) = spec.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix_len = end.parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 || size == 0 {
+            return Err(());
+        }
+        let start = size.saturating_sub(suffix_len);
+        return Ok(Some(ByteRange {
+            start,
+            end: size - 1,
+        }));
+    }
+
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= size {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        let end = end.parse::<u64>().map_err(|_| ())?;
+        if start > end {
+            return Err(());
+        }
+        end.min(size - 1)
+    };
+    Ok(Some(ByteRange { start, end }))
+}
+
+fn range_not_satisfiable_response(size: u64) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    response
+        .headers_mut()
+        .insert(CONTENT_RANGE, header(&format!("bytes */{size}")));
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+}
+
 async fn active_blob_response(active: Arc<ActiveBlob>) -> Result<BlobResponse, StatusCode> {
-    let stream: BoxByteStream = Box::pin(tail_file_stream(
+    let rx = active.chunk_tx.subscribe();
+    active_blob_response_with_rx(active, rx).await
+}
+
+async fn active_blob_response_with_rx(
+    active: Arc<ActiveBlob>,
+    rx: broadcast::Receiver<BlobChunk>,
+) -> Result<BlobResponse, StatusCode> {
+    let stream: BoxByteStream = Box::pin(tail_file_stream(active.clone(), rx));
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, header(&active.content_type));
+    let content_length = wait_for_active_content_length(&active).await;
+    if let Some(content_length) = content_length
+        && let Ok(value) = HeaderValue::from_str(&content_length.to_string())
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_LENGTH, value);
+    }
+    Ok(BlobResponse::Streaming(response))
+}
+
+async fn leader_blob_response_from_rx(
+    active: Arc<ActiveBlob>,
+    rx: mpsc::UnboundedReceiver<Bytes>,
+) -> Result<BlobResponse, StatusCode> {
+    let prefix_len = active.bytes_written.load(Ordering::SeqCst);
+    let prefix_file = if prefix_len > 0 {
+        File::open(&active.temp_path).await.ok()
+    } else {
+        None
+    };
+    let stream: BoxByteStream = Box::pin(leader_rx_stream(
         active.clone(),
-        active.chunk_tx.subscribe(),
+        rx,
+        prefix_file,
+        prefix_len,
     ));
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
@@ -504,7 +823,7 @@ async fn active_blob_response(active: Arc<ActiveBlob>) -> Result<BlobResponse, S
 }
 
 async fn wait_for_active_content_length(active: &ActiveBlob) -> Option<u64> {
-    for _ in 0..100 {
+    for _ in 0..CONTENT_LENGTH_WAIT_MILLIS {
         let content_length = active.content_length.load(Ordering::SeqCst);
         if content_length > 0 {
             return Some(content_length);
@@ -518,6 +837,9 @@ async fn wait_for_active_content_length(active: &ActiveBlob) -> Option<u64> {
 }
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
+const CLIENT_CHUNK_BYTES: usize = 256 * 1024;
+const DISK_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+const CONTENT_LENGTH_WAIT_MILLIS: usize = 50;
 
 async fn open_active_blob_file(active: &ActiveBlob) -> io::Result<File> {
     match File::open(&active.temp_path).await {
@@ -531,12 +853,14 @@ struct DownloadJob {
     cache: CacheStore,
     upstream: UpstreamClient,
     active_blobs: ActiveBlobRegistry,
+    hot_blobs: HotBlobCache,
     active_key: String,
     active: Arc<ActiveBlob>,
     link: CachedLink,
     storage_relpath: String,
     initial_content_type: String,
     resume_from: u64,
+    leader_tx: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 fn tail_file_stream(
@@ -554,7 +878,9 @@ fn tail_file_stream(
                 match rx.try_recv() {
                     Ok(chunk) => match chunk_for_offset(chunk, offset) {
                         ChunkRead::Ready(bytes) => {
-                            offset += bytes.len() as u64;
+                            let (bytes, next_offset) =
+                                coalesce_broadcast_chunks(&mut rx, bytes, offset);
+                            offset = next_offset;
                             return Some((Ok(bytes), (active, rx, file, offset)));
                         }
                         ChunkRead::AlreadyRead => continue,
@@ -614,7 +940,9 @@ fn tail_file_stream(
                         match received {
                             Ok(chunk) => match chunk_for_offset(chunk, offset) {
                                 ChunkRead::Ready(bytes) => {
-                                    offset += bytes.len() as u64;
+                                    let (bytes, next_offset) =
+                                        coalesce_broadcast_chunks(&mut rx, bytes, offset);
+                                    offset = next_offset;
                                     return Some((Ok(bytes), (active, rx, file, offset)));
                                 }
                                 ChunkRead::AlreadyRead | ChunkRead::Gap => continue,
@@ -638,6 +966,59 @@ fn tail_file_stream(
     )
 }
 
+fn leader_rx_stream(
+    active: Arc<ActiveBlob>,
+    rx: mpsc::UnboundedReceiver<Bytes>,
+    prefix_file: Option<File>,
+    prefix_remaining: u64,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    futures_util::stream::unfold(
+        (active, rx, prefix_file, prefix_remaining),
+        |(active, mut rx, mut prefix_file, mut prefix_remaining)| async move {
+            if let Some(file) = &mut prefix_file
+                && prefix_remaining > 0
+            {
+                let mut buffer = vec![0_u8; prefix_remaining.min(1024 * 1024) as usize];
+                match file.read(&mut buffer).await {
+                    Ok(0) => {
+                        prefix_file = None;
+                        prefix_remaining = 0;
+                    }
+                    Ok(read) => {
+                        buffer.truncate(read);
+                        prefix_remaining -= read as u64;
+                        return Some((
+                            Ok(Bytes::from(buffer)),
+                            (active, rx, prefix_file, prefix_remaining),
+                        ));
+                    }
+                    Err(err) => {
+                        return Some((Err(err), (active, rx, prefix_file, prefix_remaining)));
+                    }
+                }
+            }
+
+            match rx.recv().await {
+                Some(first) => {
+                    let bytes = coalesce_leader_chunks(&mut rx, first);
+                    Some((Ok(bytes), (active, rx, prefix_file, prefix_remaining)))
+                }
+                None => active
+                    .failure
+                    .lock()
+                    .ok()
+                    .and_then(|value| value.clone())
+                    .map(|message| {
+                        (
+                            Err(io::Error::other(message)),
+                            (active, rx, prefix_file, prefix_remaining),
+                        )
+                    }),
+            }
+        },
+    )
+}
+
 enum ChunkRead {
     Ready(Bytes),
     AlreadyRead,
@@ -654,6 +1035,54 @@ fn chunk_for_offset(chunk: BlobChunk, offset: u64) -> ChunkRead {
     }
     let start = (offset - chunk.offset) as usize;
     ChunkRead::Ready(chunk.bytes.slice(start..))
+}
+
+fn coalesce_broadcast_chunks(
+    rx: &mut broadcast::Receiver<BlobChunk>,
+    first: Bytes,
+    offset: u64,
+) -> (Bytes, u64) {
+    let mut next_offset = offset + first.len() as u64;
+    if first.len() >= CLIENT_CHUNK_BYTES {
+        return (first, next_offset);
+    }
+
+    let mut out = BytesMut::with_capacity(CLIENT_CHUNK_BYTES);
+    out.extend_from_slice(&first);
+    while out.len() < CLIENT_CHUNK_BYTES {
+        let chunk = match rx.try_recv() {
+            Ok(chunk) => chunk,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => break,
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        };
+        match chunk_for_offset(chunk, next_offset) {
+            ChunkRead::Ready(bytes) => {
+                next_offset += bytes.len() as u64;
+                out.extend_from_slice(&bytes);
+            }
+            ChunkRead::AlreadyRead => continue,
+            ChunkRead::Gap => break,
+        }
+    }
+    (out.freeze(), next_offset)
+}
+
+fn coalesce_leader_chunks(rx: &mut mpsc::UnboundedReceiver<Bytes>, first: Bytes) -> Bytes {
+    if first.len() >= CLIENT_CHUNK_BYTES {
+        return first;
+    }
+
+    let mut out = BytesMut::with_capacity(CLIENT_CHUNK_BYTES);
+    out.extend_from_slice(&first);
+    while out.len() < CLIENT_CHUNK_BYTES {
+        match rx.try_recv() {
+            Ok(chunk) => out.extend_from_slice(&chunk),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    out.freeze()
 }
 
 async fn wait_for_active_progress(active: &ActiveBlob, offset: u64) {
@@ -687,9 +1116,12 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     job.cache.prepare_blob_parent(&job.storage_relpath).await?;
     let mut resume_from = job.resume_from;
     let temp_path = job.cache.blob_temp_path(&job.storage_relpath);
-    let mut hasher = Sha256::new();
+    let verify_sha256 = job.link.hash_name.as_deref() == Some("sha256");
+    let mut hasher = verify_sha256.then(Sha256::new);
     if resume_from > 0 {
-        hash_existing_prefix(&temp_path, &mut hasher).await?;
+        if let Some(hasher) = &mut hasher {
+            hash_existing_prefix(&temp_path, hasher).await?;
+        }
     }
 
     let mut upstream_file = job
@@ -707,7 +1139,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     if resume_from > 0 && upstream_file.range.map(|range| range.start) != Some(resume_from) {
         let _ = tokio::fs::remove_file(&temp_path).await;
         resume_from = 0;
-        hasher = Sha256::new();
+        hasher = verify_sha256.then(Sha256::new);
         job.active.bytes_written.store(0, Ordering::SeqCst);
         job.active.notify.notify_waiters();
         upstream_file = job.upstream.open_file(&job.link.upstream_url).await?;
@@ -736,6 +1168,97 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         job.active.notify.notify_waiters();
     }
 
+    let (write_tx, write_rx) = mpsc::unbounded_channel();
+    let writer_active = job.active.clone();
+    let writer_temp_path = temp_path.clone();
+    let writer = tokio::spawn(async move {
+        write_blob_chunks_task(writer_temp_path, resume_from, writer_active, write_rx).await
+    });
+
+    let mut bytes_received = resume_from;
+    let mut stream = upstream_file.into_stream().map_err(io::Error::other);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if let Some(hasher) = &mut hasher {
+            hasher.update(&chunk);
+        }
+        let chunk_offset = bytes_received;
+        bytes_received += chunk.len() as u64;
+        let _ = job.active.chunk_tx.send(BlobChunk {
+            offset: chunk_offset,
+            bytes: chunk.clone(),
+        });
+        if let Some(leader_tx) = &job.leader_tx {
+            let _ = leader_tx.send(chunk.clone());
+        }
+        job.active.notify.notify_waiters();
+
+        if write_tx.send(chunk).is_err() {
+            return Err(io::Error::other("blob writer task stopped"));
+        }
+    }
+    drop(write_tx);
+
+    if let (Some(hasher), Some(expected)) = (hasher, &job.link.hash_value) {
+        let actual_hash = format!("{:x}", hasher.finalize());
+        if actual_hash != *expected {
+            let _ = writer.await.map_err(join_error)?;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "downloaded file sha256 did not match link hash",
+            ));
+        }
+    } else if verify_sha256 && job.link.hash_value.is_none() {
+        let _ = writer.await.map_err(join_error)?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sha256 link did not include an expected hash",
+        ));
+    }
+
+    let bytes_written = writer.await.map_err(join_error)??;
+    if bytes_written != bytes_received {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "cached file size did not match upstream bytes received",
+        ));
+    }
+
+    job.cache
+        .commit_blob_file(&temp_path, &job.storage_relpath)
+        .await?;
+    let blob = job
+        .cache
+        .mark_blob_ready(&BlobWrite {
+            blob_kind: job.link.blob_kind.clone(),
+            blob_id: job.link.blob_id.clone(),
+            storage_relpath: job.storage_relpath.clone(),
+            content_type,
+            fetched_at: current_unix_secs(),
+            size_bytes: bytes_received,
+            filename: job.link.filename.clone(),
+            upstream_url: job.link.upstream_url.clone(),
+        })
+        .await?;
+    job.hot_blobs
+        .write()
+        .await
+        .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    job.active.finished.store(true, Ordering::SeqCst);
+    job.active.notify.notify_waiters();
+    job.active_blobs.lock().await.remove(&job.active_key);
+    Ok(())
+}
+
+async fn write_blob_chunks_task(
+    temp_path: std::path::PathBuf,
+    resume_from: u64,
+    active: Arc<ActiveBlob>,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+) -> io::Result<u64> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(resume_from > 0)
@@ -744,74 +1267,35 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         .open(&temp_path)
         .await?;
     let mut bytes_written = resume_from;
-    let mut stream = upstream_file.into_stream().map_err(io::Error::other);
-    let mut pending = Vec::with_capacity(256 * 1024);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        hasher.update(&chunk);
+    let mut pending = Vec::with_capacity(DISK_FLUSH_BYTES);
+
+    while let Some(chunk) = rx.recv().await {
         pending.extend_from_slice(&chunk);
-        if bytes_written > resume_from && pending.len() < 256 * 1024 {
+        if bytes_written > resume_from && pending.len() < DISK_FLUSH_BYTES {
             continue;
         }
-        file.write_all(&pending).await?;
-        let chunk_offset = bytes_written;
-        bytes_written += pending.len() as u64;
-        job.active
-            .bytes_written
-            .store(bytes_written, Ordering::SeqCst);
-        let _ = job.active.chunk_tx.send(BlobChunk {
-            offset: chunk_offset,
-            bytes: Bytes::copy_from_slice(&pending),
-        });
-        job.active.notify.notify_waiters();
-        pending.clear();
-    }
-    if !pending.is_empty() {
-        file.write_all(&pending).await?;
-        let chunk_offset = bytes_written;
-        bytes_written += pending.len() as u64;
-        job.active
-            .bytes_written
-            .store(bytes_written, Ordering::SeqCst);
-        let _ = job.active.chunk_tx.send(BlobChunk {
-            offset: chunk_offset,
-            bytes: Bytes::copy_from_slice(&pending),
-        });
-        job.active.notify.notify_waiters();
+        flush_blob_pending(&mut file, &mut pending, &mut bytes_written, &active).await?;
     }
 
+    if !pending.is_empty() {
+        flush_blob_pending(&mut file, &mut pending, &mut bytes_written, &active).await?;
+    }
     file.flush().await?;
     file.sync_all().await?;
-    let actual_hash = format!("{:x}", hasher.finalize());
-    if job.link.hash_name.as_deref() == Some("sha256")
-        && let Some(expected) = &job.link.hash_value
-        && actual_hash != *expected
-    {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "downloaded file sha256 did not match link hash",
-        ));
-    }
+    Ok(bytes_written)
+}
 
-    job.cache
-        .commit_blob_file(&temp_path, &job.storage_relpath)
-        .await?;
-    job.cache
-        .mark_blob_ready(&BlobWrite {
-            blob_kind: job.link.blob_kind.clone(),
-            blob_id: job.link.blob_id.clone(),
-            storage_relpath: job.storage_relpath.clone(),
-            content_type,
-            fetched_at: current_unix_secs(),
-            size_bytes: bytes_written,
-            filename: job.link.filename.clone(),
-            upstream_url: job.link.upstream_url.clone(),
-        })
-        .await?;
-    job.active.finished.store(true, Ordering::SeqCst);
-    job.active.notify.notify_waiters();
-    job.active_blobs.lock().await.remove(&job.active_key);
+async fn flush_blob_pending(
+    file: &mut File,
+    pending: &mut Vec<u8>,
+    bytes_written: &mut u64,
+    active: &ActiveBlob,
+) -> io::Result<()> {
+    file.write_all(pending).await?;
+    *bytes_written += pending.len() as u64;
+    active.bytes_written.store(*bytes_written, Ordering::SeqCst);
+    active.notify.notify_waiters();
+    pending.clear();
     Ok(())
 }
 
@@ -834,6 +1318,16 @@ fn render_simple_response(
     stale: bool,
 ) -> Response<Body> {
     let etag = response_etag(body.as_bytes());
+    render_cached_simple_response(headers, content_type, body, etag, stale)
+}
+
+fn render_cached_simple_response(
+    headers: &HeaderMap,
+    content_type: &str,
+    body: String,
+    etag: String,
+    stale: bool,
+) -> Response<Body> {
     if let Some(if_none_match) = header_value(headers, IF_NONE_MATCH)
         && if_none_match.trim() == etag
     {
@@ -847,11 +1341,16 @@ fn render_simple_response(
         }
         return response;
     }
+    let content_length = body.len();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, header(content_type));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        header(&content_length.to_string()),
+    );
     response.headers_mut().insert(ETAG, header(&etag));
     if stale {
         response
@@ -894,11 +1393,12 @@ fn header(value: &str) -> HeaderValue {
     HeaderValue::from_str(value).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-fn header_value<'a>(
-    headers: &'a HeaderMap,
-    name: axum::http::header::HeaderName,
-) -> Option<&'a str> {
+fn header_value(headers: &HeaderMap, name: axum::http::header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn join_error(err: tokio::task::JoinError) -> io::Error {
+    io::Error::other(err.to_string())
 }
 
 #[cfg(test)]
@@ -926,6 +1426,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -971,6 +1473,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1007,6 +1511,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1043,6 +1549,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_dist_info_metadata_files() {
+        let upstream = spawn_upstream().await;
+        let temp = tempdir().unwrap();
+        let state = AppState {
+            cache: CacheStore::new(temp.path().to_path_buf()),
+            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
+            project_cache_ttl_secs: 3600,
+            locks: RequestLocks::default(),
+            active_blobs: ActiveBlobRegistry::default(),
+            hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
+        };
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let path = html
+            .split('"')
+            .find(|part| part.starts_with("/root/pypi/+f/"))
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_string();
+        let metadata_path = format!("{path}.metadata");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&metadata_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"metadata-bytes");
+        assert_eq!(upstream.file_requests(), 0);
+        assert_eq!(upstream.metadata_requests(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&metadata_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"metadata-bytes");
+        assert_eq!(upstream.metadata_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn serves_byte_ranges_for_cached_file_downloads() {
+        let upstream = spawn_upstream().await;
+        let temp = tempdir().unwrap();
+        let state = AppState {
+            cache: CacheStore::new(temp.path().to_path_buf()),
+            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
+            project_cache_ttl_secs: 3600,
+            locks: RequestLocks::default(),
+            active_blobs: ActiveBlobRegistry::default(),
+            hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
+        };
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let path = html
+            .split('"')
+            .find(|part| part.starts_with("/root/pypi/+f/"))
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"wheel-bytes");
+        assert_eq!(upstream.file_requests(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(RANGE, "bytes=0-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 0-4/11"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "5"
+        );
+        assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"wheel");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(RANGE, "bytes=6-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 6-10/11"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"bytes");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(RANGE, "bytes=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 6-10/11"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"bytes");
+        assert_eq!(upstream.file_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_unsatisfiable_cached_file_ranges() {
+        let upstream = spawn_upstream().await;
+        let temp = tempdir().unwrap();
+        let state = AppState {
+            cache: CacheStore::new(temp.path().to_path_buf()),
+            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
+            project_cache_ttl_secs: 3600,
+            locks: RequestLocks::default(),
+            active_blobs: ActiveBlobRegistry::default(),
+            hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
+        };
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let path = html
+            .split('"')
+            .find(|part| part.starts_with("/root/pypi/+f/"))
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        for range in ["bytes=11-", "bytes=5-3", "bytes=-0", "bytes=0-1,2-3"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header(RANGE, range)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(response.headers().get(CONTENT_RANGE).unwrap(), "bytes */11");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(body.is_empty());
+        }
+        assert_eq!(upstream.file_requests(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_file_downloads_share_single_upstream_fetch() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
@@ -1053,6 +1815,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1110,6 +1874,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1186,6 +1952,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1242,6 +2010,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1311,6 +2081,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1385,6 +2157,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1447,6 +2221,8 @@ mod tests {
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         };
         state.cache.initialize().await.unwrap();
         let app = app(state);
@@ -1505,18 +2281,23 @@ mod tests {
         chunk_bytes: usize,
         chunk_delay: Duration,
     ) -> TestUpstream {
+        let metadata = Bytes::from_static(b"metadata-bytes");
         let state = Arc::new(TestUpstreamState {
             broken: Mutex::new(false),
             file_requests: AtomicUsize::new(0),
+            metadata_requests: AtomicUsize::new(0),
             chunks_sent: AtomicUsize::new(0),
             sha256: format!("{:x}", Sha256::digest(data.as_ref())),
+            metadata_sha256: format!("{:x}", Sha256::digest(metadata.as_ref())),
             data,
+            metadata,
             chunk_bytes,
             chunk_delay,
         });
         let app = Router::new()
             .route("/simple/demo/", get(upstream_demo))
             .route("/packages/demo-1.0.whl", get(upstream_file))
+            .route("/packages/demo-1.0.whl.metadata", get(upstream_metadata))
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1529,20 +2310,52 @@ mod tests {
         }
     }
 
-    async fn upstream_demo(State(state): State<Arc<TestUpstreamState>>) -> Response<Body> {
+    async fn upstream_demo(
+        State(state): State<Arc<TestUpstreamState>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
         if *state.broken.lock().await {
             let mut response = Response::new(Body::from("boom"));
             *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
+        }
+        if wants_json(header_value(&headers, ACCEPT)) {
+            let body = serde_json::json!({
+                "meta": {"api-version": "1.0"},
+                "name": "demo",
+                "files": [
+                    {
+                        "filename": "demo-1.0.whl",
+                        "url": "/packages/demo-1.0.whl",
+                        "hashes": {"sha256": state.sha256},
+                        "requires-python": ">=3.10",
+                        "dist-info-metadata": {"sha256": state.metadata_sha256},
+                    }
+                ],
+            })
+            .to_string();
+            let mut response = Response::new(Body::from(body));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(json_media_type()));
+            response
+                .headers_mut()
+                .insert(ETAG, HeaderValue::from_static("\"etag-demo\""));
+            response
+                .headers_mut()
+                .insert("x-pypi-last-serial", HeaderValue::from_static("17"));
             return response;
         }
         let body = r#"
             <!DOCTYPE html>
             <html><body>
               <a href="/packages/demo-1.0.whl#sha256=__SHA256__"
-                 data-requires-python="&gt;=3.10">demo-1.0.whl</a>
+                 data-requires-python="&gt;=3.10"
+                 data-dist-info-metadata="sha256=__METADATA_SHA256__">demo-1.0.whl</a>
             </body></html>
         "#
-        .replace("__SHA256__", &state.sha256);
+        .replace("__SHA256__", &state.sha256)
+        .replace("__METADATA_SHA256__", &state.metadata_sha256);
         let mut response = Response::new(Body::from(body));
         response
             .headers_mut()
@@ -1612,6 +2425,20 @@ mod tests {
         response
     }
 
+    async fn upstream_metadata(State(state): State<Arc<TestUpstreamState>>) -> impl IntoResponse {
+        state.metadata_requests.fetch_add(1, Ordering::SeqCst);
+        let mut response = Response::new(Body::from(state.metadata.clone()));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            header(&state.metadata.len().to_string()),
+        );
+        response
+    }
+
     struct TestUpstream {
         base_url: String,
         state: Arc<TestUpstreamState>,
@@ -1622,6 +2449,10 @@ mod tests {
             self.state.file_requests.load(Ordering::SeqCst)
         }
 
+        fn metadata_requests(&self) -> usize {
+            self.state.metadata_requests.load(Ordering::SeqCst)
+        }
+
         fn chunks_sent(&self) -> usize {
             self.state.chunks_sent.load(Ordering::SeqCst)
         }
@@ -1630,9 +2461,12 @@ mod tests {
     struct TestUpstreamState {
         broken: Mutex<bool>,
         file_requests: AtomicUsize,
+        metadata_requests: AtomicUsize,
         chunks_sent: AtomicUsize,
         sha256: String,
+        metadata_sha256: String,
         data: Bytes,
+        metadata: Bytes,
         chunk_bytes: usize,
         chunk_delay: Duration,
     }

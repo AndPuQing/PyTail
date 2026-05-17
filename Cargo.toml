@@ -10,7 +10,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "native-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "http2", "json", "native-tls", "stream", "zstd"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +19,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 url = "2"
 
 [dev-dependencies]

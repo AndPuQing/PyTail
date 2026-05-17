@@ -137,6 +137,27 @@ impl CacheStore {
             .map_err(join_error)?
     }
 
+    pub async fn touch_project(
+        &self,
+        project: &str,
+        fetched_at: u64,
+        expires_at: u64,
+    ) -> io::Result<()> {
+        let db_path = self.db_path.clone();
+        let project = normalize_project_name(project);
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            conn.execute(
+                "UPDATE projects SET fetched_at = ?2, expires_at = ?3 WHERE project = ?1",
+                params![project, fetched_at, expires_at],
+            )
+            .map_err(sqlite_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn blob_status(&self, blob_kind: &str, blob_id: &str) -> io::Result<BlobStatus> {
         let db_path = self.db_path.clone();
         let blob_kind = blob_kind.to_string();
@@ -303,11 +324,16 @@ impl CacheStore {
                 ],
             )
             .map_err(sqlite_error)?;
-            blob_status_db(&db_path, &blob.blob_kind, &blob.blob_id).and_then(|status| {
-                let BlobStatus::Ready(blob) = status else {
-                    return Err(io::Error::other("blob did not become ready"));
-                };
-                Ok(blob)
+            Ok(BlobInfo {
+                blob_kind: blob.blob_kind,
+                blob_id: blob.blob_id,
+                storage_relpath: blob.storage_relpath,
+                content_type: blob.content_type,
+                fetched_at: blob.fetched_at,
+                size_bytes: blob.size_bytes,
+                filename: blob.filename,
+                upstream_url: blob.upstream_url,
+                state: BLOB_STATE_READY.to_string(),
             })
         })
         .await
@@ -388,6 +414,7 @@ fn init_db(path: &Path) -> io::Result<()> {
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA busy_timeout=5000;
+        PRAGMA temp_store=MEMORY;
 
         CREATE TABLE IF NOT EXISTS projects (
             project TEXT PRIMARY KEY,
@@ -446,6 +473,13 @@ fn open_db(path: &Path) -> io::Result<Connection> {
     let conn = Connection::open(path).map_err(sqlite_error)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(sqlite_error)?;
+    conn.execute_batch(
+        "
+        PRAGMA synchronous=NORMAL;
+        PRAGMA temp_store=MEMORY;
+        ",
+    )
+    .map_err(sqlite_error)?;
     Ok(conn)
 }
 
@@ -553,33 +587,46 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
         params![record.project],
     )
     .map_err(sqlite_error)?;
-    for (position, link) in record.links.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO project_links (
+    {
+        let mut insert_link = tx
+            .prepare(
+                "INSERT INTO project_links (
                 project, position, filename, upstream_url, blob_kind, blob_id,
                 requires_python, yanked, gpg_sig, dist_info_metadata, core_metadata, hash_name, hash_value
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                record.project,
-                position as i64,
-                link.filename,
-                link.upstream_url,
-                link.blob_kind,
-                link.blob_id,
-                link.requires_python,
-                link.yanked,
-                link.gpg_sig.map(|value| if value { 1 } else { 0 }),
-                link.dist_info_metadata,
-                link.core_metadata,
-                link.hash_name,
-                link.hash_value,
-            ],
-        )
-        .map_err(sqlite_error)?;
+            )
+            .map_err(sqlite_error)?;
+        for (position, link) in record.links.iter().enumerate() {
+            insert_link
+                .execute(params![
+                    record.project,
+                    position as i64,
+                    link.filename,
+                    link.upstream_url,
+                    link.blob_kind,
+                    link.blob_id,
+                    link.requires_python,
+                    link.yanked,
+                    link.gpg_sig.map(|value| if value { 1 } else { 0 }),
+                    link.dist_info_metadata,
+                    link.core_metadata,
+                    link.hash_name,
+                    link.hash_value,
+                ])
+                .map_err(sqlite_error)?;
+        }
     }
     tx.commit().map_err(sqlite_error)?;
-    load_project_db(path, &record.project)?
-        .ok_or_else(|| io::Error::other("stored project could not be reloaded"))
+    Ok(ProjectCache {
+        project: record.project.clone(),
+        fetched_at: record.fetched_at,
+        expires_at: record.expires_at,
+        upstream_etag: record.upstream_etag.clone(),
+        upstream_serial: record.upstream_serial,
+        upstream_project_url: record.upstream_project_url.clone(),
+        raw_body: record.raw_body.clone(),
+        links: record.links.clone(),
+    })
 }
 
 fn blob_status_db(path: &Path, blob_kind: &str, blob_id: &str) -> io::Result<BlobStatus> {

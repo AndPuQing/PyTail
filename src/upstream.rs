@@ -1,13 +1,17 @@
 use crate::simple::normalize_project_name;
 use bytes::Bytes;
 use futures_util::Stream;
-use reqwest::header::{ACCEPT, CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
+use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE};
 use reqwest::{Response as ReqwestResponse, StatusCode};
 use std::io;
 use std::time::Duration;
 use url::Url;
 
-const SIMPLE_HTML_ACCEPT: &str = "application/vnd.pypi.simple.v1+html, text/html;q=0.9";
+const SIMPLE_ACCEPT: &str = concat!(
+    "application/vnd.pypi.simple.v1+json, ",
+    "application/vnd.pypi.simple.v1+html;q=0.9, ",
+    "text/html;q=0.8"
+);
 const PYPI_LAST_SERIAL: &str = "x-pypi-last-serial";
 
 #[derive(Debug, Clone)]
@@ -20,8 +24,15 @@ pub struct UpstreamClient {
 pub struct FetchedProjectPage {
     pub project_url: String,
     pub body: String,
+    pub format: ProjectPageFormat,
     pub etag: Option<String>,
     pub serial: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectPageFormat {
+    Html,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,10 +64,7 @@ impl UpstreamClient {
         etag: Option<&str>,
     ) -> io::Result<ProjectFetch> {
         let url = self.project_url(project)?;
-        let mut request = self
-            .client
-            .get(url.clone())
-            .header(ACCEPT, SIMPLE_HTML_ACCEPT);
+        let mut request = self.client.get(url.clone()).header(ACCEPT, SIMPLE_ACCEPT);
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -74,10 +82,17 @@ impl UpstreamClient {
                     .get(PYPI_LAST_SERIAL)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok());
+                let format = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(project_page_format)
+                    .unwrap_or(ProjectPageFormat::Html);
                 let body = response.text().await.map_err(io_other)?;
                 Ok(ProjectFetch::Fresh(FetchedProjectPage {
                     project_url: final_url,
                     body,
+                    format,
                     etag,
                     serial,
                 }))
@@ -149,6 +164,20 @@ impl UpstreamClient {
         self.base_url
             .join(&format!("simple/{}/", normalize_project_name(project)))
             .map_err(invalid_input)
+    }
+}
+
+fn project_page_format(content_type: &str) -> ProjectPageFormat {
+    if content_type
+        .to_ascii_lowercase()
+        .contains("application/vnd.pypi.simple.v1+json")
+        || content_type
+            .to_ascii_lowercase()
+            .contains("application/json")
+    {
+        ProjectPageFormat::Json
+    } else {
+        ProjectPageFormat::Html
     }
 }
 

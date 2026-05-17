@@ -1,6 +1,7 @@
 use crate::cache::CachedLink;
 use scraper::{Html, Selector};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use url::Url;
 
@@ -73,7 +74,7 @@ pub fn parse_project_links(body: &str, page_url: &Url) -> Vec<ParsedLink> {
         let filename = if filename.is_empty() {
             resolved
                 .path_segments()
-                .and_then(|segments| segments.last())
+                .and_then(|mut segments| segments.next_back())
                 .unwrap_or("artifact")
                 .to_string()
         } else {
@@ -96,6 +97,105 @@ pub fn parse_project_links(body: &str, page_url: &Url) -> Vec<ParsedLink> {
         });
     }
     links
+}
+
+pub fn parse_project_json_links(body: &str, page_url: &Url) -> Result<Vec<ParsedLink>, String> {
+    let page: SimpleProjectJson = serde_json::from_str(body).map_err(|err| err.to_string())?;
+    let mut links = Vec::with_capacity(page.files.len());
+    for file in page.files {
+        let resolved = page_url.join(&file.url).map_err(|err| err.to_string())?;
+        let filename = file.filename.unwrap_or_else(|| {
+            resolved
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .unwrap_or("artifact")
+                .to_string()
+        });
+        let (fragment_hash_name, fragment_hash_value) = split_hash_fragment(resolved.fragment());
+        let (hash_name, hash_value) = file
+            .hashes
+            .as_ref()
+            .and_then(first_hash)
+            .unwrap_or((fragment_hash_name, fragment_hash_value));
+        let mut upstream_url = resolved.clone();
+        upstream_url.set_fragment(None);
+        links.push(ParsedLink {
+            filename,
+            upstream_url: upstream_url.to_string(),
+            requires_python: file.requires_python,
+            yanked: file.yanked.and_then(yanked_from_json),
+            gpg_sig: file.gpg_sig,
+            dist_info_metadata: file.dist_info_metadata.and_then(metadata_from_json),
+            core_metadata: file.core_metadata.and_then(metadata_from_json),
+            hash_name,
+            hash_value,
+        });
+    }
+    Ok(links)
+}
+
+#[derive(Debug, Deserialize)]
+struct SimpleProjectJson {
+    #[serde(default)]
+    files: Vec<SimpleProjectFileJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimpleProjectFileJson {
+    filename: Option<String>,
+    url: String,
+    #[serde(default)]
+    hashes: Option<Map<String, Value>>,
+    #[serde(rename = "requires-python")]
+    requires_python: Option<String>,
+    yanked: Option<Value>,
+    #[serde(rename = "gpg-sig")]
+    gpg_sig: Option<bool>,
+    #[serde(rename = "dist-info-metadata")]
+    dist_info_metadata: Option<Value>,
+    #[serde(rename = "core-metadata")]
+    core_metadata: Option<Value>,
+}
+
+fn first_hash(hashes: &Map<String, Value>) -> Option<(Option<String>, Option<String>)> {
+    if let Some(value) = hashes.get("sha256").and_then(Value::as_str) {
+        return Some((Some("sha256".to_string()), Some(value.to_string())));
+    }
+    hashes.iter().find_map(|(name, value)| {
+        value
+            .as_str()
+            .map(|value| (Some(name.clone()), Some(value.to_string())))
+    })
+}
+
+fn yanked_from_json(value: Value) -> Option<String> {
+    match value {
+        Value::Bool(true) => Some(String::new()),
+        Value::Bool(false) | Value::Null => None,
+        Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn metadata_from_json(value: Value) -> Option<String> {
+    match value {
+        Value::Bool(true) => Some("true".to_string()),
+        Value::Bool(false) | Value::Null => None,
+        Value::String(value) => Some(value),
+        Value::Object(mut object) => {
+            if let Some(value) = object.remove("sha256").and_then(|value| match value {
+                Value::String(value) => Some(value),
+                _ => None,
+            }) {
+                return Some(format!("sha256={value}"));
+            }
+            object.into_iter().find_map(|(name, value)| match value {
+                Value::String(value) => Some(format!("{name}={value}")),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
 }
 
 pub fn render_root_html(projects: &[String]) -> String {
@@ -335,5 +435,44 @@ mod tests {
         assert_eq!(links[0].requires_python.as_deref(), Some(">=3.10"));
         assert_eq!(links[0].yanked.as_deref(), Some(""));
         assert_eq!(links[0].gpg_sig, Some(true));
+    }
+
+    #[test]
+    fn parses_project_json_links_with_metadata() {
+        let page_url = Url::parse("https://example.test/simple/demo/").unwrap();
+        let body = r#"
+        {
+          "meta": {"api-version": "1.0"},
+          "name": "demo",
+          "files": [
+            {
+              "filename": "demo-1.0.whl",
+              "url": "../../packages/demo-1.0.whl",
+              "hashes": {"sha256": "abcd"},
+              "requires-python": ">=3.10",
+              "yanked": "bad release",
+              "gpg-sig": true,
+              "dist-info-metadata": {"sha256": "metaabcd"}
+            }
+          ]
+        }
+        "#;
+
+        let links = parse_project_json_links(body, &page_url).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].filename, "demo-1.0.whl");
+        assert_eq!(
+            links[0].upstream_url,
+            "https://example.test/packages/demo-1.0.whl"
+        );
+        assert_eq!(links[0].hash_name.as_deref(), Some("sha256"));
+        assert_eq!(links[0].hash_value.as_deref(), Some("abcd"));
+        assert_eq!(links[0].requires_python.as_deref(), Some(">=3.10"));
+        assert_eq!(links[0].yanked.as_deref(), Some("bad release"));
+        assert_eq!(links[0].gpg_sig, Some(true));
+        assert_eq!(
+            links[0].dist_info_metadata.as_deref(),
+            Some("sha256=metaabcd")
+        );
     }
 }
