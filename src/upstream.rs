@@ -73,6 +73,20 @@ impl UpstreamClient {
         })
     }
 
+    pub fn new_project_root(base_url: &str, timeout_secs: u64) -> io::Result<Self> {
+        let mut client = Self::new(base_url, timeout_secs)?;
+        client.base_is_simple_root = true;
+        Ok(client)
+    }
+
+    pub fn child_project_root(&self, path: &str, timeout_secs: u64) -> io::Result<Self> {
+        let base_url = self
+            .base_url
+            .join(&format!("{}/", path.trim_matches('/')))
+            .map_err(invalid_input)?;
+        Self::new_project_root(base_url.as_str(), timeout_secs)
+    }
+
     pub async fn fetch_project(
         &self,
         project: &str,
@@ -179,7 +193,7 @@ impl UpstreamClient {
         })
     }
 
-    fn project_url(&self, project: &str) -> io::Result<Url> {
+    pub(crate) fn project_url(&self, project: &str) -> io::Result<Url> {
         let path = if self.base_is_simple_root {
             format!("{}/", normalize_project_name(project))
         } else {
@@ -267,6 +281,16 @@ mod tests {
         assert_eq!(
             client.project_url("Requests").unwrap().as_str(),
             "https://mirror.example/simple/requests/"
+        );
+    }
+
+    #[test]
+    fn project_root_base_url_places_project_directly_under_base_url() {
+        let client =
+            UpstreamClient::new_project_root("https://download.pytorch.org/whl/cu126", 5).unwrap();
+        assert_eq!(
+            client.project_url("Torch").unwrap().as_str(),
+            "https://download.pytorch.org/whl/cu126/torch/"
         );
     }
 }

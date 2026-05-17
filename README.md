@@ -80,10 +80,25 @@ uv pip install --index-url http://127.0.0.1:3141/simple/ requests
 pip install --index-url http://127.0.0.1:3141/simple/ requests
 ```
 
+PyTorch wheel indexes are also exposed under `/pytorch-wheels/`, so a command
+that uses:
+
+```sh
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+can use the local caching endpoint instead:
+
+```sh
+pip install torch --index-url http://127.0.0.1:3141/pytorch-wheels/cu126
+```
+
 ## Configuration
 
 - `--bind`: listen address, default `127.0.0.1:3141`
 - `--upstream-base-url`: upstream index origin, default `https://pypi.org`
+- `--torch-url`: PyTorch wheels upstream root, default
+  `https://download.pytorch.org/whl/`
 - `--cache-dir`: local cache directory, default `.cache/pytail`
 - `--project-cache-ttl-secs`: refresh age for cached project pages, default `900`
 - `--request-timeout-secs`: upstream HTTP timeout, default `15`

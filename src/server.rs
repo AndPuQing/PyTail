@@ -5,7 +5,8 @@ use crate::cache::{
 use crate::config::AppConfig;
 use crate::simple::{
     json_media_type, normalize_project_name, parse_project_json_links, parse_project_links,
-    render_project_html, render_project_json, render_root_html, render_root_json, wants_json,
+    render_project_html_with_file_base, render_project_json_with_file_base, render_root_html,
+    render_root_json, wants_json,
 };
 use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient};
 use axum::Router;
@@ -42,6 +43,8 @@ use url::Url;
 struct AppState {
     cache: CacheStore,
     upstream: UpstreamClient,
+    pytorch_wheels_upstream: UpstreamClient,
+    request_timeout_secs: u64,
     project_cache_ttl_secs: u64,
     locks: RequestLocks,
     active_blobs: ActiveBlobRegistry,
@@ -60,6 +63,8 @@ const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
 const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
 const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
+const PYPI_FILE_BASE_PATH: &str = "/root/pypi/+f";
+const PYTORCH_WHEELS_FILE_BASE_PATH: &str = "/pytorch-wheels/+f";
 
 #[derive(Clone)]
 struct HotProject {
@@ -151,6 +156,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
     info!(
         bind = %local_addr,
         upstream = %config.upstream_base_url,
+        pytorch_wheels_upstream = %config.pytorch_wheels_upstream_base_url,
         cache_dir = %config.cache_dir.display(),
         project_cache_ttl_secs = config.project_cache_ttl_secs,
         request_timeout_secs = config.request_timeout_secs,
@@ -161,6 +167,11 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
     let state = AppState {
         cache,
         upstream: UpstreamClient::new(&config.upstream_base_url, config.request_timeout_secs)?,
+        pytorch_wheels_upstream: UpstreamClient::new_project_root(
+            &config.pytorch_wheels_upstream_base_url,
+            config.request_timeout_secs,
+        )?,
+        request_timeout_secs: config.request_timeout_secs,
         project_cache_ttl_secs: config.project_cache_ttl_secs,
         locks: RequestLocks::default(),
         active_blobs: ActiveBlobRegistry::default(),
@@ -186,9 +197,27 @@ fn app(state: AppState) -> Router {
         .route("/simple/", get(simple_root))
         .route("/simple/{project}", get(simple_project))
         .route("/simple/{project}/", get(simple_project))
+        .route("/pytorch-wheels/{project}", get(pytorch_wheels_project))
+        .route("/pytorch-wheels/{project}/", get(pytorch_wheels_project))
+        .route(
+            "/pytorch-wheels/{channel}/{project}",
+            get(pytorch_wheels_channel_project),
+        )
+        .route(
+            "/pytorch-wheels/{channel}/{project}/",
+            get(pytorch_wheels_channel_project),
+        )
         .route(
             "/root/pypi/{plusf}/{route_a}/{route_b}/{filename}",
             get(package_file),
+        )
+        .route(
+            "/pytorch-wheels/{plusf}/{route_a}/{route_b}/{filename}",
+            get(pytorch_wheels_package_file),
+        )
+        .route(
+            "/pytorch-wheels/{channel}/{plusf}/{route_a}/{route_b}/{filename}",
+            get(pytorch_wheels_channel_package_file),
         )
         .with_state(Arc::new(state))
 }
@@ -237,27 +266,7 @@ async fn simple_project(
     debug!(project = %normalized, "serving project page");
     match ensure_project(&state, &normalized).await {
         Ok(ProjectState::Ready(hot_project, stale)) => {
-            let format_json = wants_json(header_value(&headers, ACCEPT));
-            let (content_type, body, etag) = if format_json {
-                (
-                    json_media_type(),
-                    hot_project.rendered.json_body,
-                    hot_project.rendered.json_etag,
-                )
-            } else {
-                (
-                    "text/html; charset=utf-8",
-                    hot_project.rendered.html_body,
-                    hot_project.rendered.html_etag,
-                )
-            };
-            debug!(
-                project = %normalized,
-                stale,
-                format = if format_json { "json" } else { "html" },
-                "project page ready"
-            );
-            render_cached_simple_response(&headers, content_type, body, etag, stale)
+            project_response(&headers, normalized, *hot_project, stale)
         }
         Ok(ProjectState::Missing) => {
             info!(project = %normalized, "project not found upstream");
@@ -270,9 +279,144 @@ async fn simple_project(
     }
 }
 
+async fn pytorch_wheels_project(
+    State(state): State<Arc<AppState>>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let normalized = normalize_project_name(&project);
+    let cache_project = pytorch_wheels_cache_project(None, &normalized);
+    debug!(project = %normalized, "serving pytorch wheels project page");
+    match ensure_project_with(
+        &state,
+        &state.pytorch_wheels_upstream,
+        &cache_project,
+        &normalized,
+        PYTORCH_WHEELS_FILE_BASE_PATH,
+    )
+    .await
+    {
+        Ok(ProjectState::Ready(hot_project, stale)) => {
+            project_response(&headers, normalized, *hot_project, stale)
+        }
+        Ok(ProjectState::Missing) => {
+            info!(project = %normalized, "pytorch wheels project not found upstream");
+            text_response(StatusCode::NOT_FOUND, "project not found\n")
+        }
+        Err(status) => {
+            warn!(project = %normalized, %status, "pytorch wheels project request failed");
+            text_response(status, "upstream unavailable\n")
+        }
+    }
+}
+
+async fn pytorch_wheels_channel_project(
+    State(state): State<Arc<AppState>>,
+    Path((channel, project)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let channel = normalize_project_name(&channel);
+    let normalized = normalize_project_name(&project);
+    let cache_project = pytorch_wheels_cache_project(Some(&channel), &normalized);
+    let file_base_path = pytorch_wheels_channel_file_base_path(&channel);
+    let upstream = match state
+        .pytorch_wheels_upstream
+        .child_project_root(&channel, state.request_timeout_secs)
+    {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "upstream unavailable\n");
+        }
+    };
+    debug!(channel, project = %normalized, "serving pytorch wheels channel project page");
+    match ensure_project_with(
+        &state,
+        &upstream,
+        &cache_project,
+        &normalized,
+        &file_base_path,
+    )
+    .await
+    {
+        Ok(ProjectState::Ready(hot_project, stale)) => {
+            project_response(&headers, normalized, *hot_project, stale)
+        }
+        Ok(ProjectState::Missing) => {
+            info!(channel, project = %normalized, "pytorch wheels project not found upstream");
+            text_response(StatusCode::NOT_FOUND, "project not found\n")
+        }
+        Err(status) => {
+            warn!(channel, project = %normalized, %status, "pytorch wheels project request failed");
+            text_response(status, "upstream unavailable\n")
+        }
+    }
+}
+
+fn project_response(
+    headers: &HeaderMap,
+    project: String,
+    hot_project: HotProject,
+    stale: bool,
+) -> Response<Body> {
+    let format_json = wants_json(header_value(headers, ACCEPT));
+    let (content_type, body, etag) = if format_json {
+        (
+            json_media_type(),
+            hot_project.rendered.json_body,
+            hot_project.rendered.json_etag,
+        )
+    } else {
+        (
+            "text/html; charset=utf-8",
+            hot_project.rendered.html_body,
+            hot_project.rendered.html_etag,
+        )
+    };
+    debug!(
+        project,
+        stale,
+        format = if format_json { "json" } else { "html" },
+        "project page ready"
+    );
+    render_cached_simple_response(headers, content_type, body, etag, stale)
+}
+
 async fn package_file(
     State(state): State<Arc<AppState>>,
     Path((plusf, route_a, route_b, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    package_file_from_parts(state, plusf, route_a, route_b, filename, headers).await
+}
+
+async fn pytorch_wheels_package_file(
+    State(state): State<Arc<AppState>>,
+    Path((plusf, route_a, route_b, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    package_file_from_parts(state, plusf, route_a, route_b, filename, headers).await
+}
+
+async fn pytorch_wheels_channel_package_file(
+    State(state): State<Arc<AppState>>,
+    Path((_channel, plusf, route_a, route_b, filename)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    package_file_from_parts(state, plusf, route_a, route_b, filename, headers).await
+}
+
+async fn package_file_from_parts(
+    state: Arc<AppState>,
+    plusf: String,
+    route_a: String,
+    route_b: String,
+    filename: String,
     headers: HeaderMap,
 ) -> Response<Body> {
     if plusf != "+f" {
@@ -301,6 +445,24 @@ enum ProjectState {
 }
 
 async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState, StatusCode> {
+    ensure_project_with(
+        state,
+        &state.upstream,
+        project,
+        project,
+        PYPI_FILE_BASE_PATH,
+    )
+    .await
+}
+
+async fn ensure_project_with(
+    state: &AppState,
+    upstream: &UpstreamClient,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+) -> Result<ProjectState, StatusCode> {
+    let project = cache_project;
     if let Some(hot_project) = state.hot_projects.read().await.get(project).cloned()
         && state.cache.project_is_fresh(&hot_project.cache)
     {
@@ -316,7 +478,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         && state.cache.project_is_fresh(&cached)
     {
         debug!(project, "project cache hit on disk");
-        let hot_project = build_hot_project(project, cached);
+        let hot_project = build_hot_project(display_project, file_base_path, cached);
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
@@ -331,7 +493,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         && state.cache.project_is_fresh(project_cache)
     {
         debug!(project, "project cache filled while waiting for lock");
-        let hot_project = build_hot_project(project, project_cache.clone());
+        let hot_project = build_hot_project(display_project, file_base_path, project_cache.clone());
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
@@ -339,7 +501,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     let etag = cached
         .as_ref()
         .and_then(|project_cache| project_cache.upstream_etag.as_deref());
-    let result = match state.upstream.fetch_project(project, etag).await {
+    let result = match upstream.fetch_project(display_project, etag).await {
         Ok(ProjectFetch::Fresh(page)) => {
             info!(project, "fetched fresh project page from upstream");
             let page_url = Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -393,7 +555,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                 .store_project(&record)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let hot_project = build_hot_project(project, cached);
+            let hot_project = build_hot_project(display_project, file_base_path, cached);
             cache_hot_project(state, project, hot_project.clone()).await;
             Ok(ProjectState::Ready(Box::new(hot_project), false))
         }
@@ -412,7 +574,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                     )
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                let hot_project = build_hot_project(project, cached_value);
+                let hot_project = build_hot_project(display_project, file_base_path, cached_value);
                 cache_hot_project(state, project, hot_project.clone()).await;
                 Ok(ProjectState::Ready(Box::new(hot_project), false))
             } else {
@@ -430,7 +592,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         Err(status) => {
             if let Some(cached) = cached {
                 warn!(project, "serving stale project page after refresh failure");
-                let hot_project = build_hot_project(project, cached);
+                let hot_project = build_hot_project(display_project, file_base_path, cached);
                 cache_hot_project(state, project, hot_project.clone()).await;
                 Ok(ProjectState::Ready(Box::new(hot_project), true))
             } else {
@@ -440,9 +602,9 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     }
 }
 
-fn build_hot_project(project: &str, cache: ProjectCache) -> HotProject {
-    let html_body = render_project_html(project, &cache.links);
-    let json_body = render_project_json(project, &cache.links);
+fn build_hot_project(project: &str, file_base_path: &str, cache: ProjectCache) -> HotProject {
+    let html_body = render_project_html_with_file_base(project, &cache.links, file_base_path);
+    let json_body = render_project_json_with_file_base(project, &cache.links, file_base_path);
     HotProject {
         cache,
         rendered: RenderedProject {
@@ -493,6 +655,17 @@ fn route_key_for_link(link: &CachedLink) -> String {
         return route_key(&link.blob_id[..3], &link.blob_id[3..16], &link.filename);
     }
     route_key("_url", &link.blob_id, &link.filename)
+}
+
+fn pytorch_wheels_cache_project(channel: Option<&str>, project: &str) -> String {
+    match channel {
+        Some(channel) => format!("pytorch-wheels-{channel}-{project}"),
+        None => format!("pytorch-wheels-{project}"),
+    }
+}
+
+fn pytorch_wheels_channel_file_base_path(channel: &str) -> String {
+    format!("/pytorch-wheels/{channel}/+f")
 }
 
 async fn ensure_blob(
@@ -1464,6 +1637,7 @@ mod tests {
         let record = test_project_record(project);
         build_hot_project(
             project,
+            PYPI_FILE_BASE_PATH,
             ProjectCache {
                 project: record.project,
                 fetched_at: record.fetched_at,
@@ -1488,6 +1662,25 @@ mod tests {
             filename: format!("demo-{index}.whl"),
             upstream_url: format!("https://files.example/demo-{index}.whl"),
             state: "ready".to_string(),
+        }
+    }
+
+    fn test_state(cache: CacheStore, upstream_base_url: &str) -> AppState {
+        AppState {
+            cache,
+            upstream: UpstreamClient::new(upstream_base_url, 5).unwrap(),
+            pytorch_wheels_upstream: UpstreamClient::new_project_root(
+                "https://download.pytorch.org/whl/",
+                5,
+            )
+            .unwrap(),
+            request_timeout_secs: 5,
+            project_cache_ttl_secs: 3600,
+            locks: RequestLocks::default(),
+            active_blobs: ActiveBlobRegistry::default(),
+            hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
         }
     }
 
@@ -1570,6 +1763,69 @@ mod tests {
         assert!(blobs.len() < attempted_blobs);
     }
 
+    #[test]
+    fn pytorch_wheels_endpoint_uses_namespaced_cache_and_local_file_prefix() {
+        let channel = "cu126";
+        let project = "torch";
+        let cache_project = pytorch_wheels_cache_project(Some(channel), project);
+        assert_eq!(cache_project, "pytorch-wheels-cu126-torch");
+
+        let file_base_path = pytorch_wheels_channel_file_base_path(channel);
+        let hot_project = build_hot_project(
+            project,
+            &file_base_path,
+            ProjectCache {
+                project: cache_project,
+                fetched_at: current_unix_secs(),
+                expires_at: current_unix_secs() + 3600,
+                upstream_etag: None,
+                upstream_serial: None,
+                upstream_project_url: "https://download.pytorch.org/whl/cu126/torch/".to_string(),
+                raw_body: "<html></html>".to_string(),
+                links: vec![test_link(0)],
+            },
+        );
+
+        assert!(
+            hot_project
+                .rendered
+                .html_body
+                .contains("/pytorch-wheels/cu126/+f/000/0000000000000/demo-0.whl#sha256=")
+        );
+        assert!(
+            hot_project
+                .rendered
+                .json_body
+                .contains("\"url\":\"/pytorch-wheels/cu126/+f/000/0000000000000/demo-0.whl\"")
+        );
+    }
+
+    #[test]
+    fn pytorch_wheels_upstream_places_channel_projects_under_whl_channel() {
+        let upstream =
+            UpstreamClient::new_project_root("https://download.pytorch.org/whl/", 5).unwrap();
+        let upstream = upstream.child_project_root("cu126", 5).unwrap();
+        assert_eq!(
+            upstream.project_url("Torch").unwrap().as_str(),
+            "https://download.pytorch.org/whl/cu126/torch/"
+        );
+    }
+
+    #[test]
+    fn pytorch_wheels_upstream_base_is_configurable() {
+        let upstream =
+            UpstreamClient::new_project_root("https://mirror.example/pytorch/whl/", 5).unwrap();
+        assert_eq!(
+            upstream.project_url("Torch").unwrap().as_str(),
+            "https://mirror.example/pytorch/whl/torch/"
+        );
+        let upstream = upstream.child_project_root("cu126", 5).unwrap();
+        assert_eq!(
+            upstream.project_url("Torch").unwrap().as_str(),
+            "https://mirror.example/pytorch/whl/cu126/torch/"
+        );
+    }
+
     #[tokio::test]
     async fn download_pipeline_write_channel_is_bounded() {
         let (tx, mut rx) = mpsc::channel::<Bytes>(BLOB_WRITE_CHANNEL_CAPACITY);
@@ -1600,16 +1856,10 @@ mod tests {
     #[tokio::test]
     async fn evicted_hot_project_falls_back_to_sqlite() {
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new("https://example.invalid/simple/", 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            "https://example.invalid/simple/",
+        );
         state.cache.initialize().await.unwrap();
         let record = test_project_record("demo");
         state.cache.store_project(&record).await.unwrap();
@@ -1631,16 +1881,10 @@ mod tests {
     async fn caches_project_and_rewrites_file_links() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -1678,16 +1922,10 @@ mod tests {
     async fn returns_json_simple_api_when_requested() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -1716,16 +1954,10 @@ mod tests {
     async fn caches_file_downloads() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -1764,16 +1996,10 @@ mod tests {
     async fn serves_dist_info_metadata_files() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -1835,16 +2061,10 @@ mod tests {
     async fn serves_byte_ranges_for_cached_file_downloads() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -1954,16 +2174,10 @@ mod tests {
     async fn rejects_unsatisfiable_cached_file_ranges() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2020,16 +2234,10 @@ mod tests {
     async fn concurrent_file_downloads_share_single_upstream_fetch() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2079,16 +2287,10 @@ mod tests {
     async fn concurrent_file_downloads_fan_out_before_blob_is_ready() {
         let upstream = spawn_slow_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2157,16 +2359,10 @@ mod tests {
     async fn concurrent_followers_get_response_before_leader_finishes() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2221,16 +2417,10 @@ mod tests {
         ]);
         let upstream = spawn_chunked_upstream(data.clone(), 1, Duration::ZERO).await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2294,16 +2484,10 @@ mod tests {
         let data = Bytes::from(data);
         let upstream = spawn_chunked_upstream(data.clone(), 1024, Duration::from_millis(1)).await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2370,16 +2554,7 @@ mod tests {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
         let cache = CacheStore::new(temp.path().to_path_buf());
-        let state = AppState {
-            cache: cache.clone(),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 3600,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let state = test_state(cache.clone(), &upstream.base_url);
         state.cache.initialize().await.unwrap();
         let app = app(state);
 
@@ -2434,16 +2609,11 @@ mod tests {
     async fn serves_stale_project_when_upstream_is_broken() {
         let upstream = spawn_upstream().await;
         let temp = tempdir().unwrap();
-        let state = AppState {
-            cache: CacheStore::new(temp.path().to_path_buf()),
-            upstream: UpstreamClient::new(&upstream.base_url, 5).unwrap(),
-            project_cache_ttl_secs: 0,
-            locks: RequestLocks::default(),
-            active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
-        };
+        let mut state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
+        state.project_cache_ttl_secs = 0;
         state.cache.initialize().await.unwrap();
         let app = app(state);
 

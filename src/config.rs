@@ -14,6 +14,12 @@ pub struct AppConfig {
     #[arg(long, default_value = "https://pypi.org")]
     pub upstream_base_url: String,
 
+    #[arg(
+        long = "torch-url",
+        default_value = "https://download.pytorch.org/whl/"
+    )]
+    pub pytorch_wheels_upstream_base_url: String,
+
     #[arg(long, default_value = ".cache/pytail")]
     pub cache_dir: PathBuf,
 

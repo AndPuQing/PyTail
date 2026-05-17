@@ -231,12 +231,24 @@ pub fn render_root_json(projects: &[String]) -> String {
 }
 
 pub fn render_project_html(project: &str, links: &[CachedLink]) -> String {
+    render_project_html_with_file_base(project, links, "/root/pypi/+f")
+}
+
+pub fn render_project_html_with_file_base(
+    project: &str,
+    links: &[CachedLink],
+    file_base_path: &str,
+) -> String {
     let mut html = String::from(
         "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"></head><body>\n",
     );
     for link in links {
         html.push_str("<a href=\"");
-        html.push_str(&escape_html_attr(&local_file_url(project, link)));
+        html.push_str(&escape_html_attr(&local_file_url_with_base(
+            project,
+            link,
+            file_base_path,
+        )));
         if let (Some(name), Some(value)) = (&link.hash_name, &link.hash_value) {
             html.push('#');
             html.push_str(name);
@@ -281,6 +293,14 @@ pub fn render_project_html(project: &str, links: &[CachedLink]) -> String {
 }
 
 pub fn render_project_json(project: &str, links: &[CachedLink]) -> String {
+    render_project_json_with_file_base(project, links, "/root/pypi/+f")
+}
+
+pub fn render_project_json_with_file_base(
+    project: &str,
+    links: &[CachedLink],
+    file_base_path: &str,
+) -> String {
     let files = links
         .iter()
         .map(|link| {
@@ -288,7 +308,7 @@ pub fn render_project_json(project: &str, links: &[CachedLink]) -> String {
             value.insert("filename".to_string(), Value::String(link.filename.clone()));
             value.insert(
                 "url".to_string(),
-                Value::String(local_file_url(project, link)),
+                Value::String(local_file_url_with_base(project, link, file_base_path)),
             );
             if let Some(hash_name) = &link.hash_name
                 && let Some(hash_value) = &link.hash_value
@@ -345,15 +365,21 @@ pub fn cached_links(project: &str, links: Vec<ParsedLink>) -> Vec<CachedLink> {
 }
 
 pub fn local_file_url(_project: &str, link: &CachedLink) -> String {
+    local_file_url_with_base(_project, link, "/root/pypi/+f")
+}
+
+pub fn local_file_url_with_base(_project: &str, link: &CachedLink, file_base_path: &str) -> String {
+    let file_base_path = file_base_path.trim_end_matches('/');
     if link.blob_kind == "sha256" && link.blob_id.len() >= 16 {
         return format!(
-            "/root/pypi/+f/{}/{}/{}",
+            "{}/{}/{}/{}",
+            file_base_path,
             &link.blob_id[..3],
             &link.blob_id[3..16],
             link.filename
         );
     }
-    format!("/root/pypi/+f/_url/{}/{}", link.blob_id, link.filename)
+    format!("{file_base_path}/_url/{}/{}", link.blob_id, link.filename)
 }
 
 fn split_hash_fragment(fragment: Option<&str>) -> (Option<String>, Option<String>) {
