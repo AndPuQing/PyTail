@@ -48,6 +48,7 @@ struct AppState {
     request_timeout_secs: u64,
     project_cache_ttl_secs: u64,
     locks: RequestLocks,
+    metrics: CacheMetrics,
     active_blobs: ActiveBlobRegistry,
     hot_projects: HotProjectCache,
     hot_links: HotLinkCache,
@@ -59,6 +60,7 @@ type HotProjectCache = Arc<RwLock<BoundedLruCache<String, HotProject>>>;
 type HotLinkCache = Arc<RwLock<BoundedLruCache<String, CachedLink>>>;
 type HotBlobCache = Arc<RwLock<BoundedLruCache<String, BlobInfo>>>;
 type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type Counter = Arc<AtomicU64>;
 
 const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
 const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
@@ -97,6 +99,68 @@ struct ActiveBlob {
 struct BlobChunk {
     offset: u64,
     bytes: Bytes,
+}
+
+#[derive(Clone, Default)]
+struct CacheMetrics {
+    project_hits: Counter,
+    project_misses: Counter,
+    blob_hits: Counter,
+    blob_misses: Counter,
+    blob_coalesced: Counter,
+}
+
+#[derive(Clone, Copy)]
+struct CacheMetricsSnapshot {
+    project_hits: u64,
+    project_misses: u64,
+    blob_hits: u64,
+    blob_misses: u64,
+    blob_coalesced: u64,
+}
+
+impl CacheMetrics {
+    fn incr_project_hit(&self) {
+        self.project_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_project_miss(&self) {
+        self.project_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_blob_hit(&self) {
+        self.blob_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_blob_miss(&self) {
+        self.blob_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_blob_coalesced(&self) {
+        self.blob_coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CacheMetricsSnapshot {
+        CacheMetricsSnapshot {
+            project_hits: self.project_hits.load(Ordering::Relaxed),
+            project_misses: self.project_misses.load(Ordering::Relaxed),
+            blob_hits: self.blob_hits.load(Ordering::Relaxed),
+            blob_misses: self.blob_misses.load(Ordering::Relaxed),
+            blob_coalesced: self.blob_coalesced.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl CacheMetricsSnapshot {
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            project_hits: self.project_hits.saturating_sub(previous.project_hits),
+            project_misses: self.project_misses.saturating_sub(previous.project_misses),
+            blob_hits: self.blob_hits.saturating_sub(previous.blob_hits),
+            blob_misses: self.blob_misses.saturating_sub(previous.blob_misses),
+            blob_coalesced: self.blob_coalesced.saturating_sub(previous.blob_coalesced),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -143,6 +207,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         cache_dir = %config.cache_dir.display(),
         project_cache_ttl_secs = config.project_cache_ttl_secs,
         request_timeout_secs = config.request_timeout_secs,
+        stats_interval_secs = config.stats_interval_secs,
         "starting pytail server"
     );
     let cache = CacheStore::new(config.cache_dir.clone());
@@ -157,6 +222,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         request_timeout_secs: config.request_timeout_secs,
         project_cache_ttl_secs: config.project_cache_ttl_secs,
         locks: RequestLocks::default(),
+        metrics: CacheMetrics::default(),
         active_blobs: ActiveBlobRegistry::default(),
         hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
             HOT_PROJECT_CACHE_MAX_ENTRIES,
@@ -168,6 +234,9 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
             HOT_BLOB_CACHE_MAX_ENTRIES,
         ))),
     };
+    if config.stats_interval_secs > 0 {
+        spawn_cache_stats_logger(state.metrics.clone(), config.stats_interval_secs);
+    }
     let app = app(state);
     axum::serve(
         listener.tap_io(|stream| {
@@ -177,6 +246,49 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
     )
     .await
     .map_err(io::Error::other)
+}
+
+fn spawn_cache_stats_logger(metrics: CacheMetrics, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        interval.tick().await;
+        let mut previous = metrics.snapshot();
+        loop {
+            interval.tick().await;
+            let current = metrics.snapshot();
+            let window = current.delta_since(previous);
+            previous = current;
+            log_cache_stats("window", window);
+            log_cache_stats("total", current);
+        }
+    });
+}
+
+fn log_cache_stats(scope: &str, snapshot: CacheMetricsSnapshot) {
+    let project_total = snapshot.project_hits + snapshot.project_misses;
+    let blob_total = snapshot.blob_hits + snapshot.blob_misses;
+    if project_total == 0 && blob_total == 0 && snapshot.blob_coalesced == 0 {
+        return;
+    }
+    info!(
+        scope,
+        project_hits = snapshot.project_hits,
+        project_misses = snapshot.project_misses,
+        project_hit_rate = format_args!("{:.2}%", hit_rate(snapshot.project_hits, project_total)),
+        blob_hits = snapshot.blob_hits,
+        blob_misses = snapshot.blob_misses,
+        blob_hit_rate = format_args!("{:.2}%", hit_rate(snapshot.blob_hits, blob_total)),
+        blob_coalesced = snapshot.blob_coalesced,
+        "cache stats"
+    );
+}
+
+fn hit_rate(hits: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 * 100.0 / total as f64
+    }
 }
 
 fn app(state: AppState) -> Router {
@@ -460,6 +572,7 @@ async fn ensure_project_with(
         && state.cache.project_is_fresh(&hot_project.cache)
     {
         debug!(project, "project cache hit in memory");
+        state.metrics.incr_project_hit();
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
 
@@ -471,6 +584,7 @@ async fn ensure_project_with(
         && state.cache.project_is_fresh(&cached)
     {
         debug!(project, "project cache hit on disk");
+        state.metrics.incr_project_hit();
         let hot_project = build_hot_project(display_project, file_base_path, cached);
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
@@ -486,6 +600,7 @@ async fn ensure_project_with(
         && state.cache.project_is_fresh(project_cache)
     {
         debug!(project, "project cache filled while waiting for lock");
+        state.metrics.incr_project_hit();
         let hot_project = build_hot_project(display_project, file_base_path, project_cache.clone());
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
@@ -494,6 +609,7 @@ async fn ensure_project_with(
     let etag = cached
         .as_ref()
         .and_then(|project_cache| project_cache.upstream_etag.as_deref());
+    state.metrics.incr_project_miss();
     let result = match upstream.fetch_project(display_project, etag).await {
         Ok(ProjectFetch::Fresh(page)) => {
             info!(project, "fetched fresh project page from upstream");
@@ -760,6 +876,7 @@ async fn ensure_link_blob(
     let key = blob_key(&link.blob_kind, &link.blob_id);
     if let Some(blob) = state.hot_blobs.write().await.get_cloned(&key) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit in memory");
+        state.metrics.incr_blob_hit();
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -770,6 +887,7 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
+        state.metrics.incr_blob_hit();
         let mut hot_blobs = state.hot_blobs.write().await;
         hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
@@ -781,6 +899,7 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download");
+        state.metrics.incr_blob_coalesced();
         return active_blob_response(active).await;
     }
 
@@ -792,14 +911,17 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
+        state.metrics.incr_blob_hit();
         let mut hot_blobs = state.hot_blobs.write().await;
         hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download after lock");
+        state.metrics.incr_blob_coalesced();
         return active_blob_response(active).await;
     }
+    state.metrics.incr_blob_miss();
     let _inserted = state
         .cache
         .mark_blob_pending(
@@ -1650,6 +1772,7 @@ mod tests {
             request_timeout_secs: 5,
             project_cache_ttl_secs: 3600,
             locks: RequestLocks::default(),
+            metrics: CacheMetrics::default(),
             active_blobs: ActiveBlobRegistry::default(),
             hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
                 HOT_PROJECT_CACHE_MAX_ENTRIES,
@@ -2275,7 +2398,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_file_downloads_share_single_upstream_fetch() {
-        let upstream = spawn_upstream().await;
+        let upstream = spawn_slow_upstream().await;
         let temp = tempdir().unwrap();
         let state = test_state(
             CacheStore::new(temp.path().to_path_buf()),
