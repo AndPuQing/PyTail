@@ -2535,6 +2535,13 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(axum::http::header::CONTENT_LENGTH)
+                        .unwrap(),
+                    "11"
+                );
                 let mut stream = response.into_body().into_data_stream();
                 let first = stream.next().await.unwrap().unwrap();
                 first_chunk_tx.send(first.clone()).await.unwrap();
