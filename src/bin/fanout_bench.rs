@@ -217,6 +217,7 @@ async fn run_path_scenarios(args: &Args) -> Result<(), Box<dyn std::error::Error
         AppConfig {
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),
+            pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
             cache_dir,
             project_cache_ttl_secs: 3600,
             request_timeout_secs: args.request_timeout_secs,
@@ -373,6 +374,7 @@ async fn run_scenario(
         AppConfig {
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),
+            pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
             cache_dir: cache_dir.clone(),
             project_cache_ttl_secs: 3600,
             request_timeout_secs: args.request_timeout_secs,

@@ -3,6 +3,8 @@ use crate::cache::{
     current_unix_secs, fallback_blob_identity, hash_blob_identity,
 };
 use crate::config::AppConfig;
+use crate::hot_cache::BoundedLruCache;
+use crate::range::parse_byte_range;
 use crate::simple::{
     json_media_type, normalize_project_name, parse_project_json_links, parse_project_links,
     render_project_html_with_file_base, render_project_json_with_file_base, render_root_html,
@@ -25,7 +27,6 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::io;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -54,9 +55,9 @@ struct AppState {
 }
 
 type ActiveBlobRegistry = Arc<Mutex<HashMap<String, Arc<ActiveBlob>>>>;
-type HotProjectCache = Arc<RwLock<HashMap<String, HotProject>>>;
-type HotLinkCache = Arc<RwLock<HashMap<String, CachedLink>>>;
-type HotBlobCache = Arc<RwLock<HashMap<String, BlobInfo>>>;
+type HotProjectCache = Arc<RwLock<BoundedLruCache<String, HotProject>>>;
+type HotLinkCache = Arc<RwLock<BoundedLruCache<String, CachedLink>>>;
+type HotBlobCache = Arc<RwLock<BoundedLruCache<String, BlobInfo>>>;
 type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
@@ -128,24 +129,6 @@ impl RequestLocks {
     }
 }
 
-fn insert_bounded<K, V>(map: &mut HashMap<K, V>, key: K, value: V, max_entries: usize)
-where
-    K: Eq + Hash + Clone,
-{
-    if max_entries == 0 {
-        return;
-    }
-    if !map.contains_key(&key) {
-        while map.len() >= max_entries {
-            let Some(evict_key) = map.keys().next().cloned() else {
-                break;
-            };
-            map.remove(&evict_key);
-        }
-    }
-    map.insert(key, value);
-}
-
 pub async fn run(config: AppConfig) -> io::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     serve_listener(config, listener).await
@@ -175,9 +158,15 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         project_cache_ttl_secs: config.project_cache_ttl_secs,
         locks: RequestLocks::default(),
         active_blobs: ActiveBlobRegistry::default(),
-        hot_projects: HotProjectCache::default(),
-        hot_links: HotLinkCache::default(),
-        hot_blobs: HotBlobCache::default(),
+        hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
+            HOT_PROJECT_CACHE_MAX_ENTRIES,
+        ))),
+        hot_links: Arc::new(RwLock::new(BoundedLruCache::new(
+            HOT_LINK_CACHE_MAX_ENTRIES,
+        ))),
+        hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
+            HOT_BLOB_CACHE_MAX_ENTRIES,
+        ))),
     };
     let app = app(state);
     axum::serve(
@@ -463,7 +452,11 @@ async fn ensure_project_with(
     file_base_path: &str,
 ) -> Result<ProjectState, StatusCode> {
     let project = cache_project;
-    if let Some(hot_project) = state.hot_projects.read().await.get(project).cloned()
+    if let Some(hot_project) = state
+        .hot_projects
+        .write()
+        .await
+        .get_cloned(&project.to_string())
         && state.cache.project_is_fresh(&hot_project.cache)
     {
         debug!(project, "project cache hit in memory");
@@ -620,21 +613,11 @@ async fn cache_hot_project(state: &AppState, project: &str, hot_project: HotProj
     {
         let mut hot_links = state.hot_links.write().await;
         for link in &hot_project.cache.links {
-            insert_bounded(
-                &mut hot_links,
-                route_key_for_link(link),
-                link.clone(),
-                HOT_LINK_CACHE_MAX_ENTRIES,
-            );
+            hot_links.insert(route_key_for_link(link), link.clone());
         }
     }
     let mut hot_projects = state.hot_projects.write().await;
-    insert_bounded(
-        &mut hot_projects,
-        project.to_string(),
-        hot_project,
-        HOT_PROJECT_CACHE_MAX_ENTRIES,
-    );
+    hot_projects.insert(project.to_string(), hot_project);
 }
 
 enum BlobResponse {
@@ -675,7 +658,7 @@ async fn ensure_blob(
     filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let key = route_key(route_a, route_b, filename);
-    let link = if let Some(link) = state.hot_links.read().await.get(&key).cloned() {
+    let link = if let Some(link) = state.hot_links.write().await.get_cloned(&key) {
         link
     } else {
         let Some(link) = state
@@ -687,12 +670,7 @@ async fn ensure_blob(
             return Err(StatusCode::NOT_FOUND);
         };
         let mut hot_links = state.hot_links.write().await;
-        insert_bounded(
-            &mut hot_links,
-            key,
-            link.clone(),
-            HOT_LINK_CACHE_MAX_ENTRIES,
-        );
+        hot_links.insert(key, link.clone());
         link
     };
 
@@ -707,7 +685,7 @@ async fn ensure_metadata_blob(
     metadata_filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let base_key = route_key(route_a, route_b, base_filename);
-    let link = if let Some(link) = state.hot_links.read().await.get(&base_key).cloned() {
+    let link = if let Some(link) = state.hot_links.write().await.get_cloned(&base_key) {
         link
     } else {
         let Some(link) = state
@@ -719,12 +697,7 @@ async fn ensure_metadata_blob(
             return Err(StatusCode::NOT_FOUND);
         };
         let mut hot_links = state.hot_links.write().await;
-        insert_bounded(
-            &mut hot_links,
-            base_key,
-            link.clone(),
-            HOT_LINK_CACHE_MAX_ENTRIES,
-        );
+        hot_links.insert(base_key, link.clone());
         link
     };
     let metadata_value = link
@@ -759,11 +732,9 @@ async fn ensure_metadata_blob(
     };
     {
         let mut hot_links = state.hot_links.write().await;
-        insert_bounded(
-            &mut hot_links,
+        hot_links.insert(
             route_key(route_a, route_b, metadata_filename),
             metadata_link.clone(),
-            HOT_LINK_CACHE_MAX_ENTRIES,
         );
     }
     ensure_link_blob(state, metadata_link, metadata_filename).await
@@ -783,7 +754,7 @@ async fn ensure_link_blob(
     filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let key = blob_key(&link.blob_kind, &link.blob_id);
-    if let Some(blob) = state.hot_blobs.read().await.get(&key).cloned() {
+    if let Some(blob) = state.hot_blobs.write().await.get_cloned(&key) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit in memory");
         return Ok(BlobResponse::Ready(blob));
     }
@@ -796,12 +767,7 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
         let mut hot_blobs = state.hot_blobs.write().await;
-        insert_bounded(
-            &mut hot_blobs,
-            key,
-            blob.clone(),
-            HOT_BLOB_CACHE_MAX_ENTRIES,
-        );
+        hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -823,12 +789,7 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
         let mut hot_blobs = state.hot_blobs.write().await;
-        insert_bounded(
-            &mut hot_blobs,
-            key,
-            blob.clone(),
-            HOT_BLOB_CACHE_MAX_ENTRIES,
-        );
+        hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
@@ -910,7 +871,7 @@ async fn cached_file_response(
             let range = match header_value(headers, RANGE) {
                 Some(value) => match parse_byte_range(value, blob.size_bytes) {
                     Ok(range) => range,
-                    Err(()) => return range_not_satisfiable_response(blob.size_bytes),
+                    Err(_) => return range_not_satisfiable_response(blob.size_bytes),
                 },
                 None => None,
             };
@@ -962,49 +923,6 @@ async fn cached_file_response(
         }
         Err(_) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "cache file missing\n"),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ByteRange {
-    start: u64,
-    end: u64,
-}
-
-fn parse_byte_range(value: &str, size: u64) -> Result<Option<ByteRange>, ()> {
-    let Some(spec) = value.trim().strip_prefix("bytes=") else {
-        return Ok(None);
-    };
-    if spec.contains(',') {
-        return Err(());
-    }
-
-    let (start, end) = spec.split_once('-').ok_or(())?;
-    if start.is_empty() {
-        let suffix_len = end.parse::<u64>().map_err(|_| ())?;
-        if suffix_len == 0 || size == 0 {
-            return Err(());
-        }
-        let start = size.saturating_sub(suffix_len);
-        return Ok(Some(ByteRange {
-            start,
-            end: size - 1,
-        }));
-    }
-
-    let start = start.parse::<u64>().map_err(|_| ())?;
-    if start >= size {
-        return Err(());
-    }
-    let end = if end.is_empty() {
-        size - 1
-    } else {
-        let end = end.parse::<u64>().map_err(|_| ())?;
-        if start > end {
-            return Err(());
-        }
-        end.min(size - 1)
-    };
-    Ok(Some(ByteRange { start, end }))
 }
 
 fn range_not_satisfiable_response(size: u64) -> Response<Body> {
@@ -1421,12 +1339,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         })
         .await?;
     let mut hot_blobs = job.hot_blobs.write().await;
-    insert_bounded(
-        &mut hot_blobs,
-        blob_key(&blob.blob_kind, &blob.blob_id),
-        blob,
-        HOT_BLOB_CACHE_MAX_ENTRIES,
-    );
+    hot_blobs.insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
     info!(
         filename = %job.link.filename,
         blob_kind = %job.link.blob_kind,
@@ -1678,9 +1591,15 @@ mod tests {
             project_cache_ttl_secs: 3600,
             locks: RequestLocks::default(),
             active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: HotProjectCache::default(),
-            hot_links: HotLinkCache::default(),
-            hot_blobs: HotBlobCache::default(),
+            hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
+                HOT_PROJECT_CACHE_MAX_ENTRIES,
+            ))),
+            hot_links: Arc::new(RwLock::new(BoundedLruCache::new(
+                HOT_LINK_CACHE_MAX_ENTRIES,
+            ))),
+            hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
+                HOT_BLOB_CACHE_MAX_ENTRIES,
+            ))),
         }
     }
 
@@ -1722,45 +1641,36 @@ mod tests {
     }
 
     #[test]
-    fn bounded_hot_cache_insert_caps_maps() {
+    fn bounded_hot_cache_uses_lru_eviction() {
         let attempted_projects = HOT_PROJECT_CACHE_MAX_ENTRIES + 25;
-        let mut projects = std::collections::HashMap::new();
+        let mut projects = BoundedLruCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES);
         for index in 0..attempted_projects {
-            insert_bounded(
-                &mut projects,
+            projects.insert(
                 format!("project-{index}"),
                 test_hot_project(&format!("project-{index}")),
-                HOT_PROJECT_CACHE_MAX_ENTRIES,
             );
         }
         assert_eq!(projects.len(), HOT_PROJECT_CACHE_MAX_ENTRIES);
         assert!(projects.len() < attempted_projects);
 
         let attempted_links = HOT_LINK_CACHE_MAX_ENTRIES + 25;
-        let mut links = std::collections::HashMap::new();
+        let mut links = BoundedLruCache::new(HOT_LINK_CACHE_MAX_ENTRIES);
         for index in 0..attempted_links {
-            insert_bounded(
-                &mut links,
-                format!("route/{index}/demo-{index}.whl"),
-                test_link(index),
-                HOT_LINK_CACHE_MAX_ENTRIES,
-            );
+            links.insert(format!("route/{index}/demo-{index}.whl"), test_link(index));
         }
         assert_eq!(links.len(), HOT_LINK_CACHE_MAX_ENTRIES);
         assert!(links.len() < attempted_links);
 
         let attempted_blobs = HOT_BLOB_CACHE_MAX_ENTRIES + 25;
-        let mut blobs = std::collections::HashMap::new();
+        let mut blobs = BoundedLruCache::new(HOT_BLOB_CACHE_MAX_ENTRIES);
         for index in 0..attempted_blobs {
-            insert_bounded(
-                &mut blobs,
-                format!("sha256:{index}"),
-                test_blob(index),
-                HOT_BLOB_CACHE_MAX_ENTRIES,
-            );
+            blobs.insert(format!("sha256:{index}"), test_blob(index));
         }
         assert_eq!(blobs.len(), HOT_BLOB_CACHE_MAX_ENTRIES);
         assert!(blobs.len() < attempted_blobs);
+
+        assert!(!projects.contains_key(&"project-0".to_string()));
+        assert!(projects.contains_key(&format!("project-{}", attempted_projects - 1)));
     }
 
     #[test]
@@ -1864,9 +1774,15 @@ mod tests {
         let record = test_project_record("demo");
         state.cache.store_project(&record).await.unwrap();
         cache_hot_project(&state, "demo", test_hot_project("demo")).await;
-        assert!(state.hot_projects.read().await.contains_key("demo"));
+        assert!(
+            state
+                .hot_projects
+                .read()
+                .await
+                .contains_key(&"demo".to_string())
+        );
 
-        state.hot_projects.write().await.remove("demo");
+        state.hot_projects.write().await.remove(&"demo".to_string());
         let project_state = ensure_project(&state, "demo").await.unwrap();
 
         let ProjectState::Ready(hot_project, stale) = project_state else {
@@ -1874,7 +1790,13 @@ mod tests {
         };
         assert!(!stale);
         assert_eq!(hot_project.cache.project, "demo");
-        assert!(state.hot_projects.read().await.contains_key("demo"));
+        assert!(
+            state
+                .hot_projects
+                .read()
+                .await
+                .contains_key(&"demo".to_string())
+        );
     }
 
     #[tokio::test]
