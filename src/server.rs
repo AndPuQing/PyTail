@@ -34,6 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 #[derive(Clone)]
@@ -119,6 +120,15 @@ pub async fn run(config: AppConfig) -> io::Result<()> {
 }
 
 pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Result<()> {
+    let local_addr = listener.local_addr()?;
+    info!(
+        bind = %local_addr,
+        upstream = %config.upstream_base_url,
+        cache_dir = %config.cache_dir.display(),
+        project_cache_ttl_secs = config.project_cache_ttl_secs,
+        request_timeout_secs = config.request_timeout_secs,
+        "starting pytail server"
+    );
     let cache = CacheStore::new(config.cache_dir.clone());
     cache.initialize().await?;
     let state = AppState {
@@ -167,6 +177,7 @@ async fn simple_root(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
+    debug!("serving simple root");
     let projects = state
         .cache
         .list_projects()
@@ -196,6 +207,7 @@ async fn simple_project(
     headers: HeaderMap,
 ) -> Response<Body> {
     let normalized = normalize_project_name(&project);
+    debug!(project = %normalized, "serving project page");
     match ensure_project(&state, &normalized).await {
         Ok(ProjectState::Ready(hot_project, stale)) => {
             let format_json = wants_json(header_value(&headers, ACCEPT));
@@ -212,10 +224,22 @@ async fn simple_project(
                     hot_project.rendered.html_etag,
                 )
             };
+            debug!(
+                project = %normalized,
+                stale,
+                format = if format_json { "json" } else { "html" },
+                "project page ready"
+            );
             render_cached_simple_response(&headers, content_type, body, etag, stale)
         }
-        Ok(ProjectState::Missing) => text_response(StatusCode::NOT_FOUND, "project not found\n"),
-        Err(status) => text_response(status, "upstream unavailable\n"),
+        Ok(ProjectState::Missing) => {
+            info!(project = %normalized, "project not found upstream");
+            text_response(StatusCode::NOT_FOUND, "project not found\n")
+        }
+        Err(status) => {
+            warn!(project = %normalized, %status, "project request failed");
+            text_response(status, "upstream unavailable\n")
+        }
     }
 }
 
@@ -225,8 +249,13 @@ async fn package_file(
     headers: HeaderMap,
 ) -> Response<Body> {
     if plusf != "+f" {
+        debug!(
+            plusf,
+            route_a, route_b, filename, "rejecting unknown file route"
+        );
         return text_response(StatusCode::NOT_FOUND, "file unavailable\n");
     }
+    debug!(route_a, route_b, filename, "serving package file");
     let response = if let Some(base_filename) = filename.strip_suffix(".metadata") {
         ensure_metadata_blob(&state, &route_a, &route_b, base_filename, &filename).await
     } else {
@@ -248,6 +277,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     if let Some(hot_project) = state.hot_projects.read().await.get(project).cloned()
         && state.cache.project_is_fresh(&hot_project.cache)
     {
+        debug!(project, "project cache hit in memory");
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
     }
 
@@ -258,6 +288,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         && state.cache.project_is_fresh(&cached)
     {
+        debug!(project, "project cache hit on disk");
         let hot_project = build_hot_project(project, cached);
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
@@ -272,6 +303,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
     if let Some(project_cache) = &cached
         && state.cache.project_is_fresh(project_cache)
     {
+        debug!(project, "project cache filled while waiting for lock");
         let hot_project = build_hot_project(project, project_cache.clone());
         cache_hot_project(state, project, hot_project.clone()).await;
         return Ok(ProjectState::Ready(Box::new(hot_project), false));
@@ -282,6 +314,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
         .and_then(|project_cache| project_cache.upstream_etag.as_deref());
     let result = match state.upstream.fetch_project(project, etag).await {
         Ok(ProjectFetch::Fresh(page)) => {
+            info!(project, "fetched fresh project page from upstream");
             let page_url = Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
             let parsed_links = match page.format {
                 ProjectPageFormat::Json => parse_project_json_links(&page.body, &page_url)
@@ -312,6 +345,11 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
                     }
                 })
                 .collect::<Vec<_>>();
+            info!(
+                project,
+                links = links.len(),
+                "parsed upstream project links"
+            );
             let now = current_unix_secs();
             let record = ProjectRecord {
                 project: project.to_string(),
@@ -333,6 +371,7 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
             Ok(ProjectState::Ready(Box::new(hot_project), false))
         }
         Ok(ProjectFetch::NotModified) => {
+            debug!(project, "upstream project page not modified");
             if let Some(mut cached_value) = cached.clone() {
                 let now = current_unix_secs();
                 cached_value.fetched_at = now;
@@ -354,12 +393,16 @@ async fn ensure_project(state: &AppState, project: &str) -> Result<ProjectState,
             }
         }
         Ok(ProjectFetch::NotFound) => Ok(ProjectState::Missing),
-        Err(_) => Err(StatusCode::BAD_GATEWAY),
+        Err(err) => {
+            warn!(project, error = %err, "failed to fetch project page from upstream");
+            Err(StatusCode::BAD_GATEWAY)
+        }
     };
     match result {
         Ok(value) => Ok(value),
         Err(status) => {
             if let Some(cached) = cached {
+                warn!(project, "serving stale project page after refresh failure");
                 let hot_project = build_hot_project(project, cached);
                 cache_hot_project(state, project, hot_project.clone()).await;
                 Ok(ProjectState::Ready(Box::new(hot_project), true))
@@ -517,6 +560,7 @@ async fn ensure_link_blob(
 ) -> Result<BlobResponse, StatusCode> {
     let key = blob_key(&link.blob_kind, &link.blob_id);
     if let Some(blob) = state.hot_blobs.read().await.get(&key).cloned() {
+        debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit in memory");
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -526,6 +570,7 @@ async fn ensure_link_blob(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
+        debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
         state.hot_blobs.write().await.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
@@ -535,6 +580,7 @@ async fn ensure_link_blob(
         .blob_storage_relpath(&link.blob_kind, &link.blob_id, filename)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
+        debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download");
         return active_blob_response(active).await;
     }
 
@@ -545,10 +591,12 @@ async fn ensure_link_blob(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
+        debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
         state.hot_blobs.write().await.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
+        debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download after lock");
         return active_blob_response(active).await;
     }
     let _inserted = state
@@ -574,6 +622,13 @@ async fn ensure_link_blob(
     } else {
         0
     };
+    info!(
+        filename,
+        blob_kind = %link.blob_kind,
+        blob_id = %link.blob_id,
+        resume_from,
+        "starting blob download"
+    );
     let active = Arc::new(ActiveBlob {
         temp_path: state.cache.blob_temp_path(&storage_relpath),
         final_path: state.cache.blob_path(&storage_relpath),
@@ -1068,6 +1123,13 @@ async fn wait_for_active_progress(active: &ActiveBlob, offset: u64) {
 async fn download_blob_task(job: DownloadJob) {
     if let Err(err) = download_blob_task_inner(&job).await {
         let message = err.to_string();
+        error!(
+            filename = %job.link.filename,
+            blob_kind = %job.link.blob_kind,
+            blob_id = %job.link.blob_id,
+            error = %message,
+            "blob download failed"
+        );
         if let Ok(mut failure) = job.active.failure.lock() {
             *failure = Some(message);
         }
@@ -1086,6 +1148,11 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     if resume_from > 0
         && let Some(hasher) = &mut hasher
     {
+        debug!(
+            filename = %job.link.filename,
+            resume_from,
+            "hashing existing blob prefix before resume"
+        );
         hash_existing_prefix(&temp_path, hasher).await?;
     }
 
@@ -1102,6 +1169,11 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         .await?;
 
     if resume_from > 0 && upstream_file.range.map(|range| range.start) != Some(resume_from) {
+        warn!(
+            filename = %job.link.filename,
+            resume_from,
+            "upstream did not honor range request, restarting blob download"
+        );
         let _ = tokio::fs::remove_file(&temp_path).await;
         resume_from = 0;
         hasher = verify_sha256.then(Sha256::new);
@@ -1127,6 +1199,11 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         upstream_file.content_length
     };
     if let Some(content_length) = content_length {
+        debug!(
+            filename = %job.link.filename,
+            content_length,
+            "upstream blob content length"
+        );
         job.active
             .content_length
             .store(content_length, Ordering::SeqCst);
@@ -1212,6 +1289,13 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         .write()
         .await
         .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    info!(
+        filename = %job.link.filename,
+        blob_kind = %job.link.blob_kind,
+        blob_id = %job.link.blob_id,
+        size_bytes = bytes_received,
+        "blob download completed"
+    );
     job.active.finished.store(true, Ordering::SeqCst);
     job.active.notify.notify_waiters();
     job.active_blobs.lock().await.remove(&job.active_key);

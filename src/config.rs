@@ -22,4 +22,7 @@ pub struct AppConfig {
 
     #[arg(long, default_value_t = 15)]
     pub request_timeout_secs: u64,
+
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
 }

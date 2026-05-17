@@ -220,6 +220,7 @@ async fn run_path_scenarios(args: &Args) -> Result<(), Box<dyn std::error::Error
             cache_dir,
             project_cache_ttl_secs: 3600,
             request_timeout_secs: args.request_timeout_secs,
+            verbose: false,
         },
         proxy_listener,
     ));
@@ -375,6 +376,7 @@ async fn run_scenario(
             cache_dir: cache_dir.clone(),
             project_cache_ttl_secs: 3600,
             request_timeout_secs: args.request_timeout_secs,
+            verbose: false,
         },
         proxy_listener,
     ));

@@ -87,6 +87,7 @@ pip install --index-url http://127.0.0.1:3141/simple/ requests
 - `--cache-dir`: local cache directory, default `.cache/pytail`
 - `--project-cache-ttl-secs`: refresh age for cached project pages, default `900`
 - `--request-timeout-secs`: upstream HTTP timeout, default `15`
+- `--verbose`: enable debug logging for pytail
 
 ## Package
 

@@ -5,6 +5,7 @@ use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, 
 use reqwest::{Response as ReqwestResponse, StatusCode};
 use std::io;
 use std::time::Duration;
+use tracing::debug;
 use url::Url;
 
 const SIMPLE_ACCEPT: &str = concat!(
@@ -17,6 +18,7 @@ const PYPI_LAST_SERIAL: &str = "x-pypi-last-serial";
 #[derive(Debug, Clone)]
 pub struct UpstreamClient {
     base_url: Url,
+    base_is_simple_root: bool,
     client: reqwest::Client,
 }
 
@@ -49,13 +51,26 @@ impl UpstreamClient {
             let path = format!("{}/", base_url.path());
             base_url.set_path(&path);
         }
+        let base_is_simple_root = base_url
+            .path_segments()
+            .and_then(|mut segments| {
+                segments
+                    .by_ref()
+                    .rfind(|segment| !segment.is_empty())
+                    .map(|segment| segment.eq_ignore_ascii_case("simple"))
+            })
+            .unwrap_or(false);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(timeout_secs))
             .read_timeout(Duration::from_secs(timeout_secs))
             .user_agent(format!("pytail/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(io_other)?;
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            base_is_simple_root,
+            client,
+        })
     }
 
     pub async fn fetch_project(
@@ -68,7 +83,9 @@ impl UpstreamClient {
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
+        debug!(%url, has_etag = etag.is_some(), "fetching upstream project page");
         let response = request.send().await.map_err(io_other)?;
+        debug!(%url, status = %response.status(), "upstream project page response");
         match response.status() {
             StatusCode::OK => {
                 let etag = response
@@ -111,11 +128,13 @@ impl UpstreamClient {
 
     pub async fn open_file_range(&self, url: &str, start: Option<u64>) -> io::Result<UpstreamFile> {
         let url = Url::parse(url).map_err(invalid_input)?;
+        debug!(%url, ?start, "opening upstream file");
         let mut request = self.client.get(url);
         if let Some(start) = start {
             request = request.header(RANGE, format!("bytes={start}-"));
         }
         let response = request.send().await.map_err(io_other)?;
+        debug!(url = %response.url(), status = %response.status(), "upstream file response");
         if response.status() == StatusCode::NOT_FOUND {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -161,9 +180,12 @@ impl UpstreamClient {
     }
 
     fn project_url(&self, project: &str) -> io::Result<Url> {
-        self.base_url
-            .join(&format!("simple/{}/", normalize_project_name(project)))
-            .map_err(invalid_input)
+        let path = if self.base_is_simple_root {
+            format!("{}/", normalize_project_name(project))
+        } else {
+            format!("simple/{}/", normalize_project_name(project))
+        };
+        self.base_url.join(&path).map_err(invalid_input)
     }
 }
 
@@ -224,4 +246,27 @@ fn invalid_input(err: impl std::fmt::Display) -> io::Error {
 
 fn io_other(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_url_accepts_origin_base_url() {
+        let client = UpstreamClient::new("https://pypi.org", 5).unwrap();
+        assert_eq!(
+            client.project_url("Requests").unwrap().as_str(),
+            "https://pypi.org/simple/requests/"
+        );
+    }
+
+    #[test]
+    fn project_url_accepts_simple_root_base_url() {
+        let client = UpstreamClient::new("https://mirror.example/simple", 5).unwrap();
+        assert_eq!(
+            client.project_url("Requests").unwrap().as_str(),
+            "https://mirror.example/simple/requests/"
+        );
+    }
 }
