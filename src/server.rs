@@ -88,6 +88,7 @@ struct ActiveBlob {
     final_path: std::path::PathBuf,
     content_type: String,
     content_length: AtomicU64,
+    initial_bytes: u64,
     bytes_written: AtomicU64,
     finished: AtomicBool,
     notify: Notify,
@@ -957,6 +958,7 @@ async fn ensure_link_blob(
         final_path: state.cache.blob_path(&storage_relpath),
         content_type: initial_content_type.clone(),
         content_length: AtomicU64::new(0),
+        initial_bytes: resume_from,
         bytes_written: AtomicU64::new(resume_from),
         finished: AtomicBool::new(false),
         notify: Notify::new(),
@@ -1072,13 +1074,13 @@ async fn active_blob_response_with_rx(
     active: Arc<ActiveBlob>,
     rx: broadcast::Receiver<BlobChunk>,
 ) -> Result<BlobResponse, StatusCode> {
+    let content_length = wait_for_active_response_start(&active).await?;
     let stream: BoxByteStream = Box::pin(tail_file_stream(active.clone(), rx));
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, header(&active.content_type));
-    let content_length = wait_for_active_content_length(&active).await;
     if let Some(content_length) = content_length
         && let Ok(value) = HeaderValue::from_str(&content_length.to_string())
     {
@@ -1089,18 +1091,36 @@ async fn active_blob_response_with_rx(
     Ok(BlobResponse::Streaming(response))
 }
 
-async fn wait_for_active_content_length(active: &ActiveBlob) -> Option<u64> {
-    for _ in 0..CONTENT_LENGTH_WAIT_MILLIS {
+async fn wait_for_active_response_start(active: &ActiveBlob) -> Result<Option<u64>, StatusCode> {
+    loop {
+        let notified = active.notify.notified();
+        if let Some(message) = active_failure_message(active) {
+            return Err(active_failure_status(&message));
+        }
         let content_length = active.content_length.load(Ordering::SeqCst);
         if content_length > 0 {
-            return Some(content_length);
+            return Ok(Some(content_length));
+        }
+        let bytes_written = active.bytes_written.load(Ordering::SeqCst);
+        if bytes_written > active.initial_bytes {
+            return Ok(None);
         }
         if active.finished.load(Ordering::SeqCst) {
-            return None;
+            if let Some(message) = active_failure_message(active) {
+                return Err(active_failure_status(&message));
+            }
+            return Ok(Some(bytes_written));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        notified.await;
     }
-    None
+}
+
+fn active_failure_status(message: &str) -> StatusCode {
+    if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
@@ -1108,7 +1128,6 @@ const CLIENT_CHUNK_BYTES: usize = 256 * 1024;
 const DISK_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 const BLOB_BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 const BLOB_WRITE_CHANNEL_CAPACITY: usize = 8;
-const CONTENT_LENGTH_WAIT_MILLIS: usize = 50;
 
 async fn open_active_blob_file(active: &ActiveBlob) -> io::Result<File> {
     match File::open(&active.temp_path).await {
@@ -1952,6 +1971,7 @@ mod tests {
             final_path: temp.path().join("blob"),
             content_type: "application/octet-stream".to_string(),
             content_length: AtomicU64::new(0),
+            initial_bytes: 0,
             bytes_written: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             notify: Notify::new(),
@@ -2005,6 +2025,28 @@ mod tests {
             .expect("stream ended without reporting failure");
         let err = item.expect_err("stream item should be an error");
         assert_eq!(err.to_string(), "download failed");
+    }
+
+    #[tokio::test]
+    async fn active_blob_response_returns_error_before_streaming_starts() {
+        let temp = tempdir().unwrap();
+        let active = test_active_blob(&temp);
+        let response = tokio::spawn({
+            let active = active.clone();
+            async move { active_blob_response(active).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fail_active_blob(&active, "upstream file request timed out");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .expect("response did not wake after failure")
+            .unwrap();
+        let Err(status) = result else {
+            panic!("failure before first byte should return a status");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
