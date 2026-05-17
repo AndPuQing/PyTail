@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tag matches package versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "Release publishing only runs from version tags." >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          python - "$version" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          expected = sys.argv[1]
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+
+          versions = {
+              "Cargo.toml package.version": cargo["package"]["version"],
+              "pyproject.toml project.version": pyproject["project"]["version"],
+          }
+
+          mismatches = [f"{name}={value!r}" for name, value in versions.items() if value != expected]
+          if mismatches:
+              raise SystemExit(
+                  f"Tag v{expected} does not match package versions: {', '.join(mismatches)}"
+              )
+          PY
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  build-wheels:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+          - platform: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+          - platform: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+          manylinux: ${{ matrix.manylinux || 'off' }}
+          sccache: "true"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-sdist:
+    name: Build source distribution
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install maturin
+        run: python -m pip install --upgrade "maturin>=1.13,<2"
+
+      - name: Build sdist
+        run: maturin sdist --out dist
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs:
+      - build-wheels
+      - build-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pytail
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
