@@ -24,6 +24,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -54,6 +55,11 @@ type HotProjectCache = Arc<RwLock<HashMap<String, HotProject>>>;
 type HotLinkCache = Arc<RwLock<HashMap<String, CachedLink>>>;
 type HotBlobCache = Arc<RwLock<HashMap<String, BlobInfo>>>;
 type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
+const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
+const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
+const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
 
 #[derive(Clone)]
 struct HotProject {
@@ -106,12 +112,33 @@ impl RequestLocks {
     async fn guard(&self, map: &RequestLockMap, key: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut map = map.lock().await;
+            if map.len() >= REQUEST_LOCK_CLEANUP_THRESHOLD {
+                map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
             map.entry(key.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
         lock.lock_owned().await
     }
+}
+
+fn insert_bounded<K, V>(map: &mut HashMap<K, V>, key: K, value: V, max_entries: usize)
+where
+    K: Eq + Hash + Clone,
+{
+    if max_entries == 0 {
+        return;
+    }
+    if !map.contains_key(&key) {
+        while map.len() >= max_entries {
+            let Some(evict_key) = map.keys().next().cloned() else {
+                break;
+            };
+            map.remove(&evict_key);
+        }
+    }
+    map.insert(key, value);
 }
 
 pub async fn run(config: AppConfig) -> io::Result<()> {
@@ -431,14 +458,21 @@ async fn cache_hot_project(state: &AppState, project: &str, hot_project: HotProj
     {
         let mut hot_links = state.hot_links.write().await;
         for link in &hot_project.cache.links {
-            hot_links.insert(route_key_for_link(link), link.clone());
+            insert_bounded(
+                &mut hot_links,
+                route_key_for_link(link),
+                link.clone(),
+                HOT_LINK_CACHE_MAX_ENTRIES,
+            );
         }
     }
-    state
-        .hot_projects
-        .write()
-        .await
-        .insert(project.to_string(), hot_project);
+    let mut hot_projects = state.hot_projects.write().await;
+    insert_bounded(
+        &mut hot_projects,
+        project.to_string(),
+        hot_project,
+        HOT_PROJECT_CACHE_MAX_ENTRIES,
+    );
 }
 
 enum BlobResponse {
@@ -479,7 +513,13 @@ async fn ensure_blob(
         else {
             return Err(StatusCode::NOT_FOUND);
         };
-        state.hot_links.write().await.insert(key, link.clone());
+        let mut hot_links = state.hot_links.write().await;
+        insert_bounded(
+            &mut hot_links,
+            key,
+            link.clone(),
+            HOT_LINK_CACHE_MAX_ENTRIES,
+        );
         link
     };
 
@@ -505,7 +545,13 @@ async fn ensure_metadata_blob(
         else {
             return Err(StatusCode::NOT_FOUND);
         };
-        state.hot_links.write().await.insert(base_key, link.clone());
+        let mut hot_links = state.hot_links.write().await;
+        insert_bounded(
+            &mut hot_links,
+            base_key,
+            link.clone(),
+            HOT_LINK_CACHE_MAX_ENTRIES,
+        );
         link
     };
     let metadata_value = link
@@ -538,10 +584,15 @@ async fn ensure_metadata_blob(
         hash_name,
         hash_value,
     };
-    state.hot_links.write().await.insert(
-        route_key(route_a, route_b, metadata_filename),
-        metadata_link.clone(),
-    );
+    {
+        let mut hot_links = state.hot_links.write().await;
+        insert_bounded(
+            &mut hot_links,
+            route_key(route_a, route_b, metadata_filename),
+            metadata_link.clone(),
+            HOT_LINK_CACHE_MAX_ENTRIES,
+        );
+    }
     ensure_link_blob(state, metadata_link, metadata_filename).await
 }
 
@@ -571,7 +622,13 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
-        state.hot_blobs.write().await.insert(key, blob.clone());
+        let mut hot_blobs = state.hot_blobs.write().await;
+        insert_bounded(
+            &mut hot_blobs,
+            key,
+            blob.clone(),
+            HOT_BLOB_CACHE_MAX_ENTRIES,
+        );
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -592,7 +649,13 @@ async fn ensure_link_blob(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
-        state.hot_blobs.write().await.insert(key, blob.clone());
+        let mut hot_blobs = state.hot_blobs.write().await;
+        insert_bounded(
+            &mut hot_blobs,
+            key,
+            blob.clone(),
+            HOT_BLOB_CACHE_MAX_ENTRIES,
+        );
         return Ok(BlobResponse::Ready(blob));
     }
     if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
@@ -637,7 +700,7 @@ async fn ensure_link_blob(
         bytes_written: AtomicU64::new(resume_from),
         finished: AtomicBool::new(false),
         notify: Notify::new(),
-        chunk_tx: broadcast::channel(1024).0,
+        chunk_tx: broadcast::channel(BLOB_BROADCAST_CHANNEL_CAPACITY).0,
         failure: std::sync::Mutex::new(None),
     });
     state
@@ -647,7 +710,7 @@ async fn ensure_link_blob(
         .insert(key.clone(), active.clone());
     drop(guard);
 
-    let (leader_tx, leader_rx) = mpsc::unbounded_channel();
+    let leader_rx = active.chunk_tx.subscribe();
     tokio::spawn(download_blob_task(DownloadJob {
         cache: state.cache.clone(),
         upstream: state.upstream.clone(),
@@ -659,10 +722,9 @@ async fn ensure_link_blob(
         storage_relpath,
         initial_content_type,
         resume_from,
-        leader_tx: Some(leader_tx),
     }));
 
-    leader_blob_response_from_rx(active, leader_rx).await
+    active_blob_response_with_rx(active, leader_rx).await
 }
 
 async fn cached_file_response(
@@ -810,38 +872,6 @@ async fn active_blob_response_with_rx(
     Ok(BlobResponse::Streaming(response))
 }
 
-async fn leader_blob_response_from_rx(
-    active: Arc<ActiveBlob>,
-    rx: mpsc::UnboundedReceiver<Bytes>,
-) -> Result<BlobResponse, StatusCode> {
-    let prefix_len = active.bytes_written.load(Ordering::SeqCst);
-    let prefix_file = if prefix_len > 0 {
-        File::open(&active.temp_path).await.ok()
-    } else {
-        None
-    };
-    let stream: BoxByteStream = Box::pin(leader_rx_stream(
-        active.clone(),
-        rx,
-        prefix_file,
-        prefix_len,
-    ));
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, header(&active.content_type));
-    let content_length = wait_for_active_content_length(&active).await;
-    if let Some(content_length) = content_length
-        && let Ok(value) = HeaderValue::from_str(&content_length.to_string())
-    {
-        response
-            .headers_mut()
-            .insert(axum::http::header::CONTENT_LENGTH, value);
-    }
-    Ok(BlobResponse::Streaming(response))
-}
-
 async fn wait_for_active_content_length(active: &ActiveBlob) -> Option<u64> {
     for _ in 0..CONTENT_LENGTH_WAIT_MILLIS {
         let content_length = active.content_length.load(Ordering::SeqCst);
@@ -859,6 +889,8 @@ async fn wait_for_active_content_length(active: &ActiveBlob) -> Option<u64> {
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 const CLIENT_CHUNK_BYTES: usize = 256 * 1024;
 const DISK_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+const BLOB_BROADCAST_CHANNEL_CAPACITY: usize = 1024;
+const BLOB_WRITE_CHANNEL_CAPACITY: usize = 8;
 const CONTENT_LENGTH_WAIT_MILLIS: usize = 50;
 
 async fn open_active_blob_file(active: &ActiveBlob) -> io::Result<File> {
@@ -880,7 +912,6 @@ struct DownloadJob {
     storage_relpath: String,
     initial_content_type: String,
     resume_from: u64,
-    leader_tx: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 fn tail_file_stream(
@@ -950,7 +981,11 @@ fn tail_file_stream(
 
                 let content_length = active.content_length.load(Ordering::SeqCst);
                 if content_length > 0 && offset >= content_length {
-                    return None;
+                    if active.finished.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    active.notify.notified().await;
+                    continue;
                 }
                 if active.finished.load(Ordering::SeqCst) {
                     return None;
@@ -981,59 +1016,6 @@ fn tail_file_stream(
                         }
                     }
                 }
-            }
-        },
-    )
-}
-
-fn leader_rx_stream(
-    active: Arc<ActiveBlob>,
-    rx: mpsc::UnboundedReceiver<Bytes>,
-    prefix_file: Option<File>,
-    prefix_remaining: u64,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
-    futures_util::stream::unfold(
-        (active, rx, prefix_file, prefix_remaining),
-        |(active, mut rx, mut prefix_file, mut prefix_remaining)| async move {
-            if let Some(file) = &mut prefix_file
-                && prefix_remaining > 0
-            {
-                let mut buffer = vec![0_u8; prefix_remaining.min(1024 * 1024) as usize];
-                match file.read(&mut buffer).await {
-                    Ok(0) => {
-                        prefix_file = None;
-                        prefix_remaining = 0;
-                    }
-                    Ok(read) => {
-                        buffer.truncate(read);
-                        prefix_remaining -= read as u64;
-                        return Some((
-                            Ok(Bytes::from(buffer)),
-                            (active, rx, prefix_file, prefix_remaining),
-                        ));
-                    }
-                    Err(err) => {
-                        return Some((Err(err), (active, rx, prefix_file, prefix_remaining)));
-                    }
-                }
-            }
-
-            match rx.recv().await {
-                Some(first) => {
-                    let bytes = coalesce_leader_chunks(&mut rx, first);
-                    Some((Ok(bytes), (active, rx, prefix_file, prefix_remaining)))
-                }
-                None => active
-                    .failure
-                    .lock()
-                    .ok()
-                    .and_then(|value| value.clone())
-                    .map(|message| {
-                        (
-                            Err(io::Error::other(message)),
-                            (active, rx, prefix_file, prefix_remaining),
-                        )
-                    }),
             }
         },
     )
@@ -1086,23 +1068,6 @@ fn coalesce_broadcast_chunks(
         }
     }
     (out.freeze(), next_offset)
-}
-
-fn coalesce_leader_chunks(rx: &mut mpsc::UnboundedReceiver<Bytes>, first: Bytes) -> Bytes {
-    if first.len() >= CLIENT_CHUNK_BYTES {
-        return first;
-    }
-
-    let mut out = BytesMut::with_capacity(CLIENT_CHUNK_BYTES);
-    out.extend_from_slice(&first);
-    while out.len() < CLIENT_CHUNK_BYTES {
-        match rx.try_recv() {
-            Ok(chunk) => out.extend_from_slice(&chunk),
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
-        }
-    }
-    out.freeze()
 }
 
 async fn wait_for_active_progress(active: &ActiveBlob, offset: u64) {
@@ -1210,7 +1175,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         job.active.notify.notify_waiters();
     }
 
-    let (write_tx, write_rx) = mpsc::unbounded_channel();
+    let (write_tx, write_rx) = mpsc::channel(BLOB_WRITE_CHANNEL_CAPACITY);
     let writer_active = job.active.clone();
     let writer_temp_path = temp_path.clone();
     let writer = tokio::spawn(async move {
@@ -1230,12 +1195,9 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
             offset: chunk_offset,
             bytes: chunk.clone(),
         });
-        if let Some(leader_tx) = &job.leader_tx {
-            let _ = leader_tx.send(chunk.clone());
-        }
         job.active.notify.notify_waiters();
 
-        if write_tx.send(chunk).is_err() {
+        if write_tx.send(chunk).await.is_err() {
             return Err(io::Error::other("blob writer task stopped"));
         }
     }
@@ -1285,10 +1247,13 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
             upstream_url: job.link.upstream_url.clone(),
         })
         .await?;
-    job.hot_blobs
-        .write()
-        .await
-        .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    let mut hot_blobs = job.hot_blobs.write().await;
+    insert_bounded(
+        &mut hot_blobs,
+        blob_key(&blob.blob_kind, &blob.blob_id),
+        blob,
+        HOT_BLOB_CACHE_MAX_ENTRIES,
+    );
     info!(
         filename = %job.link.filename,
         blob_kind = %job.link.blob_kind,
@@ -1296,9 +1261,9 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         size_bytes = bytes_received,
         "blob download completed"
     );
+    job.active_blobs.lock().await.remove(&job.active_key);
     job.active.finished.store(true, Ordering::SeqCst);
     job.active.notify.notify_waiters();
-    job.active_blobs.lock().await.remove(&job.active_key);
     Ok(())
 }
 
@@ -1306,7 +1271,7 @@ async fn write_blob_chunks_task(
     temp_path: std::path::PathBuf,
     resume_from: u64,
     active: Arc<ActiveBlob>,
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
+    mut rx: mpsc::Receiver<Bytes>,
 ) -> io::Result<u64> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -1463,6 +1428,204 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
+
+    fn test_link(index: usize) -> CachedLink {
+        let blob_id = format!("{index:064x}");
+        CachedLink {
+            filename: format!("demo-{index}.whl"),
+            upstream_url: format!("https://files.example/demo-{index}.whl"),
+            blob_kind: "sha256".to_string(),
+            blob_id: blob_id.clone(),
+            requires_python: None,
+            yanked: None,
+            gpg_sig: None,
+            dist_info_metadata: None,
+            core_metadata: None,
+            hash_name: Some("sha256".to_string()),
+            hash_value: Some(blob_id),
+        }
+    }
+
+    fn test_project_record(project: &str) -> ProjectRecord {
+        let now = current_unix_secs();
+        ProjectRecord {
+            project: project.to_string(),
+            fetched_at: now,
+            expires_at: now + 3600,
+            upstream_etag: Some(format!("\"etag-{project}\"")),
+            upstream_serial: Some(1),
+            upstream_project_url: format!("https://example.invalid/simple/{project}/"),
+            raw_body: "<html></html>".to_string(),
+            links: vec![test_link(0)],
+        }
+    }
+
+    fn test_hot_project(project: &str) -> HotProject {
+        let record = test_project_record(project);
+        build_hot_project(
+            project,
+            ProjectCache {
+                project: record.project,
+                fetched_at: record.fetched_at,
+                expires_at: record.expires_at,
+                upstream_etag: record.upstream_etag,
+                upstream_serial: record.upstream_serial,
+                upstream_project_url: record.upstream_project_url,
+                raw_body: record.raw_body,
+                links: record.links,
+            },
+        )
+    }
+
+    fn test_blob(index: usize) -> BlobInfo {
+        BlobInfo {
+            blob_kind: "sha256".to_string(),
+            blob_id: format!("{index:064x}"),
+            storage_relpath: format!("sha256/demo-{index}.whl"),
+            content_type: "application/octet-stream".to_string(),
+            fetched_at: current_unix_secs(),
+            size_bytes: index as u64,
+            filename: format!("demo-{index}.whl"),
+            upstream_url: format!("https://files.example/demo-{index}.whl"),
+            state: "ready".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_locks_prune_stale_project_keys() {
+        let locks = RequestLocks::default();
+        for index in 0..REQUEST_LOCK_CLEANUP_THRESHOLD {
+            let guard = locks.project_guard(&format!("stale-{index}")).await;
+            drop(guard);
+        }
+
+        let fresh_guard = locks.project_guard("fresh").await;
+        let map = locks.projects.lock().await;
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("fresh"));
+        drop(map);
+        drop(fresh_guard);
+    }
+
+    #[tokio::test]
+    async fn request_locks_keep_active_project_keys_when_pruning() {
+        let locks = RequestLocks::default();
+        let active_guard = locks.project_guard("active").await;
+        for index in 0..(REQUEST_LOCK_CLEANUP_THRESHOLD - 1) {
+            let guard = locks.project_guard(&format!("stale-{index}")).await;
+            drop(guard);
+        }
+
+        let fresh_guard = locks.project_guard("fresh").await;
+        let map = locks.projects.lock().await;
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("active"));
+        assert!(map.contains_key("fresh"));
+        drop(map);
+        drop(fresh_guard);
+        drop(active_guard);
+    }
+
+    #[test]
+    fn bounded_hot_cache_insert_caps_maps() {
+        let attempted_projects = HOT_PROJECT_CACHE_MAX_ENTRIES + 25;
+        let mut projects = std::collections::HashMap::new();
+        for index in 0..attempted_projects {
+            insert_bounded(
+                &mut projects,
+                format!("project-{index}"),
+                test_hot_project(&format!("project-{index}")),
+                HOT_PROJECT_CACHE_MAX_ENTRIES,
+            );
+        }
+        assert_eq!(projects.len(), HOT_PROJECT_CACHE_MAX_ENTRIES);
+        assert!(projects.len() < attempted_projects);
+
+        let attempted_links = HOT_LINK_CACHE_MAX_ENTRIES + 25;
+        let mut links = std::collections::HashMap::new();
+        for index in 0..attempted_links {
+            insert_bounded(
+                &mut links,
+                format!("route/{index}/demo-{index}.whl"),
+                test_link(index),
+                HOT_LINK_CACHE_MAX_ENTRIES,
+            );
+        }
+        assert_eq!(links.len(), HOT_LINK_CACHE_MAX_ENTRIES);
+        assert!(links.len() < attempted_links);
+
+        let attempted_blobs = HOT_BLOB_CACHE_MAX_ENTRIES + 25;
+        let mut blobs = std::collections::HashMap::new();
+        for index in 0..attempted_blobs {
+            insert_bounded(
+                &mut blobs,
+                format!("sha256:{index}"),
+                test_blob(index),
+                HOT_BLOB_CACHE_MAX_ENTRIES,
+            );
+        }
+        assert_eq!(blobs.len(), HOT_BLOB_CACHE_MAX_ENTRIES);
+        assert!(blobs.len() < attempted_blobs);
+    }
+
+    #[tokio::test]
+    async fn download_pipeline_write_channel_is_bounded() {
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BLOB_WRITE_CHANNEL_CAPACITY);
+        assert_eq!(tx.max_capacity(), BLOB_WRITE_CHANNEL_CAPACITY);
+
+        for _ in 0..BLOB_WRITE_CHANNEL_CAPACITY {
+            tx.send(Bytes::from_static(b"x")).await.unwrap();
+        }
+        assert_eq!(tx.capacity(), 0);
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            tx.send(Bytes::from_static(b"blocked")),
+        )
+        .await;
+        assert!(blocked.is_err());
+
+        assert!(rx.recv().await.is_some());
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            tx.send(Bytes::from_static(b"unblocked")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn evicted_hot_project_falls_back_to_sqlite() {
+        let temp = tempdir().unwrap();
+        let state = AppState {
+            cache: CacheStore::new(temp.path().to_path_buf()),
+            upstream: UpstreamClient::new("https://example.invalid/simple/", 5).unwrap(),
+            project_cache_ttl_secs: 3600,
+            locks: RequestLocks::default(),
+            active_blobs: ActiveBlobRegistry::default(),
+            hot_projects: HotProjectCache::default(),
+            hot_links: HotLinkCache::default(),
+            hot_blobs: HotBlobCache::default(),
+        };
+        state.cache.initialize().await.unwrap();
+        let record = test_project_record("demo");
+        state.cache.store_project(&record).await.unwrap();
+        cache_hot_project(&state, "demo", test_hot_project("demo")).await;
+        assert!(state.hot_projects.read().await.contains_key("demo"));
+
+        state.hot_projects.write().await.remove("demo");
+        let project_state = ensure_project(&state, "demo").await.unwrap();
+
+        let ProjectState::Ready(hot_project, stale) = project_state else {
+            panic!("expected project to load from sqlite");
+        };
+        assert!(!stale);
+        assert_eq!(hot_project.cache.project, "demo");
+        assert!(state.hot_projects.read().await.contains_key("demo"));
+    }
 
     #[tokio::test]
     async fn caches_project_and_rewrites_file_links() {
@@ -2050,7 +2213,13 @@ mod tests {
 
     #[tokio::test]
     async fn download_task_continues_when_leader_body_is_not_consumed() {
-        let upstream = spawn_slow_upstream().await;
+        let data = Bytes::from(vec![
+            b'x';
+            BLOB_BROADCAST_CHANNEL_CAPACITY
+                + BLOB_WRITE_CHANNEL_CAPACITY
+                + 16
+        ]);
+        let upstream = spawn_chunked_upstream(data.clone(), 1, Duration::ZERO).await;
         let temp = tempdir().unwrap();
         let state = AppState {
             cache: CacheStore::new(temp.path().to_path_buf()),
@@ -2094,12 +2263,14 @@ mod tests {
         assert_eq!(leader.status(), StatusCode::OK);
 
         tokio::time::timeout(Duration::from_millis(700), async {
-            while upstream.chunks_sent() < 2 {
+            while upstream.chunks_sent()
+                < BLOB_BROADCAST_CHANNEL_CAPACITY + BLOB_WRITE_CHANNEL_CAPACITY + 16
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("background download task should finish even if leader body is not polled");
+        .expect("background download task should pass the bounded buffers when leader body is not polled");
 
         let follower = app
             .clone()
@@ -2108,7 +2279,7 @@ mod tests {
             .unwrap();
         assert_eq!(follower.status(), StatusCode::OK);
         let body = to_bytes(follower.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.as_ref(), b"wheel-bytes");
+        assert_eq!(body, data);
         assert_eq!(upstream.file_requests(), 1);
         drop(leader);
     }
