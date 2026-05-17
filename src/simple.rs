@@ -1,4 +1,4 @@
-use crate::cache::CachedLink;
+use crate::cache::{CachedLink, ProjectSummary};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -198,18 +198,39 @@ fn metadata_from_json(value: Value) -> Option<String> {
     }
 }
 
-pub fn render_root_html(projects: &[String]) -> String {
+pub fn render_root_html(projects: &[ProjectSummary]) -> String {
     let mut html = String::from(
-        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>Simple Index</title>\n  </head>\n  <body>\n",
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>devpi</title>\n",
     );
-    for project in projects {
-        html.push_str("    <a href=\"");
-        html.push_str(&escape_html_attr(project));
-        html.push_str("/\">");
-        html.push_str(&escape_html(project));
-        html.push_str("</a><br/>\n");
+    push_ui_head(&mut html);
+    html.push_str("  </head>\n  <body>\n");
+    html.push_str("    <div class=\"page-shell\">\n");
+    push_header(&mut html, &[("root", "/simple/")]);
+    html.push_str(
+        "      <main id=\"content\" class=\"content\">\n        <h1 class=\"page-title\">root/pypi</h1>\n        <p class=\"subtitle\">Cached packages in root/pypi</p>\n        <p class=\"notice\">Package sizes count files already downloaded into the local cache.</p>\n",
+    );
+    if projects.is_empty() {
+        html.push_str("        <div class=\"empty-state\">No cached projects yet. Search for a package name to fetch it from upstream.</div>\n");
+    } else {
+        html.push_str("        <div class=\"project-grid\">\n");
+        for project in projects {
+            html.push_str("          <a class=\"project-link\" href=\"");
+            html.push_str(&escape_html_attr(&project.project));
+            html.push_str("/\">");
+            html.push_str(&escape_html(&project.project));
+            html.push_str("<span class=\"project-stats\">");
+            html.push_str(&project.cached_file_count.to_string());
+            html.push('/');
+            html.push_str(&project.file_count.to_string());
+            html.push_str(" files cached · ");
+            html.push_str(&format_size(project.cached_size_bytes));
+            html.push_str("</span></a>\n");
+        }
+        html.push_str("        </div>\n");
     }
-    html.push_str("  </body>\n</html>\n");
+    html.push_str("      </main>\n");
+    push_footer(&mut html);
+    html.push_str("    </div>\n  </body>\n</html>\n");
     html
 }
 
@@ -240,14 +261,23 @@ pub fn render_project_html_with_file_base(
     file_base_path: &str,
 ) -> String {
     let mut html = String::from(
-        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>Links for ",
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>",
     );
     html.push_str(&escape_html(project));
-    html.push_str("</title>\n  </head>\n  <body>\n    <h1>Links for ");
+    html.push_str(" - root/pypi</title>\n");
+    push_ui_head(&mut html);
+    html.push_str("  </head>\n  <body>\n");
+    html.push_str("    <div class=\"page-shell\">\n");
+    push_header(&mut html, &[("root", "/simple/"), ("pypi", "/simple/")]);
+    html.push_str(
+        "      <main id=\"content\" class=\"content\">\n        <h1 class=\"page-title\">",
+    );
     html.push_str(&escape_html(project));
-    html.push_str("</h1>\n");
+    html.push_str("</h1>\n        <p class=\"subtitle\">root/pypi package files</p>\n        <nav class=\"toolbar\"><a href=\"/simple/\">Index</a><a href=\"");
+    html.push_str(&escape_html_attr(&format!("/simple/{project}/")));
+    html.push_str("\">Simple API</a></nav>\n        <div class=\"file-table-wrap\">\n          <table class=\"file-table\">\n            <thead>\n              <tr><th>File</th><th>Size</th><th>Requires</th><th>Hash</th><th>Metadata</th></tr>\n            </thead>\n            <tbody>\n");
     for link in links {
-        html.push_str("    <a href=\"");
+        html.push_str("              <tr>\n                <td><a class=\"file-name\" href=\"");
         html.push_str(&escape_html_attr(&local_file_url_with_base(
             project,
             link,
@@ -290,9 +320,45 @@ pub fn render_project_html_with_file_base(
         }
         html.push('>');
         html.push_str(&escape_html(&link.filename));
-        html.push_str("</a><br/>\n");
+        html.push_str("</a>");
+        if let Some(value) = &link.yanked {
+            html.push_str(" <span class=\"badge-warning\" title=\"");
+            html.push_str(&escape_html_attr(value));
+            html.push_str("\">yanked</span>");
+        }
+        html.push_str("</td>\n                <td>");
+        match link.cached_size_bytes {
+            Some(size) => html.push_str(&format_size(size)),
+            None => html.push_str("<span class=\"muted\">not cached</span>"),
+        }
+        html.push_str("</td>\n                <td>");
+        if let Some(value) = &link.requires_python {
+            html.push_str(&escape_html(value));
+        } else {
+            html.push_str("&nbsp;");
+        }
+        html.push_str("</td>\n                <td>");
+        if let (Some(name), Some(value)) = (&link.hash_name, &link.hash_value) {
+            html.push_str("<dl class=\"meta-list\"><dt>");
+            html.push_str(&escape_html(name));
+            html.push_str("</dt><dd><code>");
+            html.push_str(&escape_html(value));
+            html.push_str("</code></dd></dl>");
+        } else {
+            html.push_str("&nbsp;");
+        }
+        html.push_str("</td>\n                <td>");
+        push_metadata_cell(&mut html, link);
+        html.push_str("</td>\n              </tr>\n");
     }
-    html.push_str("  </body>\n</html>\n");
+    if links.is_empty() {
+        html.push_str(
+            "              <tr><td colspan=\"5\">No files are cached for this project yet.</td></tr>\n",
+        );
+    }
+    html.push_str("            </tbody>\n          </table>\n        </div>\n      </main>\n");
+    push_footer(&mut html);
+    html.push_str("    </div>\n  </body>\n</html>\n");
     html
 }
 
@@ -360,6 +426,7 @@ pub fn cached_links(project: &str, links: Vec<ParsedLink>) -> Vec<CachedLink> {
             upstream_url: link.upstream_url,
             blob_kind: String::new(),
             blob_id: String::new(),
+            cached_size_bytes: None,
             requires_python: link.requires_python,
             yanked: link.yanked,
             gpg_sig: link.gpg_sig,
@@ -425,6 +492,72 @@ fn metadata_json(value: &str) -> Value {
         return json!({ name: digest });
     }
     Value::String(value.to_string())
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn push_ui_head(html: &mut String) {
+    html.push_str("    <style>");
+    html.push_str(include_str!("generated/ui.css"));
+    html.push_str("</style>\n    <script>");
+    html.push_str(include_str!("generated/ui.js"));
+    html.push_str("</script>\n");
+}
+
+fn push_header(html: &mut String, breadcrumbs: &[(&str, &str)]) {
+    html.push_str("      <header class=\"topbar\">\n        <div class=\"search-row\">\n          <a class=\"brand\" href=\"/simple/\">devpi</a>\n          <form id=\"search\" class=\"search-form\" action=\"/simple/\" method=\"get\">\n            <input class=\"search-input\" type=\"text\" name=\"q\" placeholder=\"package name\" autocomplete=\"off\">\n            <input class=\"search-button\" type=\"submit\" value=\"Search\">\n          </form>\n        </div>\n        <nav class=\"breadcrumbs\">\n");
+    for (label, href) in breadcrumbs {
+        html.push_str("          <a href=\"");
+        html.push_str(&escape_html_attr(href));
+        html.push_str("\">");
+        html.push_str(&escape_html(label));
+        html.push_str("</a><span class=\"breadcrumb-separator\">/</span>\n");
+    }
+    html.push_str("        </nav>\n      </header>\n");
+}
+
+fn push_footer(html: &mut String) {
+    html.push_str("      <footer class=\"footer\">pytail simple package index</footer>\n");
+}
+
+fn push_metadata_cell(html: &mut String, link: &CachedLink) {
+    let mut wrote = false;
+    if let Some(value) = link.gpg_sig {
+        html.push_str("<dl class=\"meta-list\"><dt>gpg-sig</dt><dd>");
+        html.push_str(if value { "true" } else { "false" });
+        html.push_str("</dd></dl>");
+        wrote = true;
+    }
+    if let Some(value) = &link.dist_info_metadata {
+        html.push_str("<dl class=\"meta-list\"><dt>dist-info</dt><dd>");
+        html.push_str(&escape_html(value));
+        html.push_str("</dd></dl>");
+        wrote = true;
+    }
+    if let Some(value) = &link.core_metadata {
+        html.push_str("<dl class=\"meta-list\"><dt>core</dt><dd>");
+        html.push_str(&escape_html(value));
+        html.push_str("</dd></dl>");
+        wrote = true;
+    }
+    if !wrote {
+        html.push_str("&nbsp;");
+    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -511,21 +644,41 @@ mod tests {
 
     #[test]
     fn renders_root_html_like_simple_index_listing() {
-        let html = render_root_html(&["demo".to_string(), "my_pkg".to_string()]);
+        let html = render_root_html(&[
+            ProjectSummary {
+                project: "demo".to_string(),
+                file_count: 2,
+                cached_file_count: 1,
+                cached_size_bytes: 2048,
+            },
+            ProjectSummary {
+                project: "my_pkg".to_string(),
+                file_count: 0,
+                cached_file_count: 0,
+                cached_size_bytes: 0,
+            },
+        ]);
 
-        assert!(html.contains("<title>Simple Index</title>"));
-        assert!(html.contains("<a href=\"demo/\">demo</a><br/>"));
-        assert!(html.contains("<a href=\"my_pkg/\">my_pkg</a><br/>"));
+        assert!(html.contains("<title>devpi</title>"));
+        assert!(html.contains("<style>"));
+        assert!(html.contains("<script>"));
+        assert!(html.contains("<form id=\"search\" class=\"search-form\""));
+        assert!(html.contains("<h1 class=\"page-title\">root/pypi</h1>"));
+        assert!(html.contains("<a class=\"project-link\" href=\"demo/\">demo"));
+        assert!(html.contains("1/2 files cached"));
+        assert!(html.contains("2.0 KB"));
+        assert!(html.contains("<a class=\"project-link\" href=\"my_pkg/\">my_pkg"));
         assert!(!html.contains("href=\"/simple/demo/\""));
     }
 
     #[test]
-    fn renders_project_html_as_line_separated_link_listing() {
+    fn renders_project_html_as_devpi_style_file_table() {
         let links = vec![CachedLink {
             filename: "demo-1.0.whl".to_string(),
             upstream_url: "https://files.example/demo-1.0.whl".to_string(),
             blob_kind: "sha256".to_string(),
             blob_id: "abcd000000000000000000000000000000000000000000000000000000000000".to_string(),
+            cached_size_bytes: Some(1536),
             requires_python: None,
             yanked: None,
             gpg_sig: None,
@@ -539,9 +692,12 @@ mod tests {
 
         let html = render_project_html("demo", &links);
 
-        assert!(html.contains("<title>Links for demo</title>"));
-        assert!(html.contains("<h1>Links for demo</h1>"));
-        assert!(html.contains("demo-1.0.whl</a><br/>"));
+        assert!(html.contains("<title>demo - root/pypi</title>"));
+        assert!(html.contains("<h1 class=\"page-title\">demo</h1>"));
+        assert!(html.contains("<table class=\"file-table\">"));
+        assert!(html.contains("demo-1.0.whl</a>"));
+        assert!(html.contains("1.5 KB"));
+        assert!(html.contains("<dt>sha256</dt>"));
     }
 
     #[test]
@@ -551,6 +707,7 @@ mod tests {
             upstream_url: "https://files.example/demo-1.0.whl".to_string(),
             blob_kind: "url".to_string(),
             blob_id: "demo-1.0.whl".to_string(),
+            cached_size_bytes: None,
             requires_python: None,
             yanked: None,
             gpg_sig: None,

@@ -16,6 +16,7 @@ pub struct CachedLink {
     pub upstream_url: String,
     pub blob_kind: String,
     pub blob_id: String,
+    pub cached_size_bytes: Option<u64>,
     pub requires_python: Option<String>,
     pub yanked: Option<String>,
     pub gpg_sig: Option<bool>,
@@ -23,6 +24,14 @@ pub struct CachedLink {
     pub core_metadata: Option<String>,
     pub hash_name: Option<String>,
     pub hash_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project: String,
+    pub file_count: u64,
+    pub cached_file_count: u64,
+    pub cached_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +119,65 @@ impl CacheStore {
                 .map_err(sqlite_error)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error)?;
+            let mut projects = Vec::new();
+            for row in rows {
+                projects.push(row.map_err(sqlite_error)?);
+            }
+            Ok(projects)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn list_project_summaries(&self) -> io::Result<Vec<ProjectSummary>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        p.project,
+                        COUNT(pl.position) AS file_count,
+                        COALESCE((
+                            SELECT COUNT(*)
+                            FROM (
+                                SELECT DISTINCT pl2.blob_kind, pl2.blob_id
+                                FROM project_links pl2
+                                JOIN blobs b2
+                                  ON b2.blob_kind = pl2.blob_kind
+                                 AND b2.blob_id = pl2.blob_id
+                                 AND b2.state = 'ready'
+                                WHERE pl2.project = p.project
+                            )
+                        ), 0) AS cached_file_count,
+                        COALESCE((
+                            SELECT SUM(size_bytes)
+                            FROM (
+                                SELECT DISTINCT b3.blob_kind, b3.blob_id, b3.size_bytes
+                                FROM project_links pl3
+                                JOIN blobs b3
+                                  ON b3.blob_kind = pl3.blob_kind
+                                 AND b3.blob_id = pl3.blob_id
+                                 AND b3.state = 'ready'
+                                WHERE pl3.project = p.project
+                            )
+                        ), 0) AS cached_size_bytes
+                     FROM projects p
+                     LEFT JOIN project_links pl ON pl.project = p.project
+                     GROUP BY p.project
+                     ORDER BY p.project",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ProjectSummary {
+                        project: row.get(0)?,
+                        file_count: row.get(1)?,
+                        cached_file_count: row.get(2)?,
+                        cached_size_bytes: row.get(3)?,
+                    })
+                })
                 .map_err(sqlite_error)?;
             let mut projects = Vec::new();
             for row in rows {
@@ -517,11 +585,20 @@ fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache
 
     let mut stmt = conn
         .prepare(
-            "SELECT filename, upstream_url, blob_kind, blob_id, requires_python, yanked, gpg_sig,
-                    dist_info_metadata, core_metadata, hash_name, hash_value
-             FROM project_links
-             WHERE project = ?1
-             ORDER BY position",
+            "SELECT pl.filename, pl.upstream_url, pl.blob_kind, pl.blob_id,
+                    (
+                        SELECT b.size_bytes
+                        FROM blobs b
+                        WHERE b.blob_kind = pl.blob_kind
+                          AND b.blob_id = pl.blob_id
+                          AND b.state = 'ready'
+                        LIMIT 1
+                    ) AS cached_size_bytes,
+                    pl.requires_python, pl.yanked, pl.gpg_sig,
+                    pl.dist_info_metadata, pl.core_metadata, pl.hash_name, pl.hash_value
+             FROM project_links pl
+             WHERE pl.project = ?1
+             ORDER BY pl.position",
         )
         .map_err(sqlite_error)?;
     let rows = stmt
@@ -531,13 +608,14 @@ fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache
                 upstream_url: row.get(1)?,
                 blob_kind: row.get(2)?,
                 blob_id: row.get(3)?,
-                requires_python: row.get(4)?,
-                yanked: row.get(5)?,
-                gpg_sig: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
-                dist_info_metadata: row.get(7)?,
-                core_metadata: row.get(8)?,
-                hash_name: row.get(9)?,
-                hash_value: row.get(10)?,
+                cached_size_bytes: row.get(4)?,
+                requires_python: row.get(5)?,
+                yanked: row.get(6)?,
+                gpg_sig: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+                dist_info_metadata: row.get(8)?,
+                core_metadata: row.get(9)?,
+                hash_name: row.get(10)?,
+                hash_value: row.get(11)?,
             })
         })
         .map_err(sqlite_error)?;
@@ -675,6 +753,7 @@ where
             upstream_url: row.get(1)?,
             blob_kind: row.get(2)?,
             blob_id: row.get(3)?,
+            cached_size_bytes: None,
             requires_python: row.get(4)?,
             yanked: row.get(5)?,
             gpg_sig: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
@@ -767,6 +846,7 @@ mod tests {
                 upstream_url: "https://files.example/requests-1.0.whl".to_string(),
                 blob_kind: "sha256".to_string(),
                 blob_id: "deadbeef".to_string(),
+                cached_size_bytes: None,
                 requires_python: None,
                 yanked: None,
                 gpg_sig: None,
@@ -783,6 +863,40 @@ mod tests {
         assert_eq!(loaded.upstream_serial, Some(42));
         assert_eq!(loaded.links.len(), 1);
         assert_eq!(loaded.links[0].blob_id, "deadbeef");
+        assert_eq!(loaded.links[0].cached_size_bytes, None);
+
+        cache
+            .mark_blob_pending(
+                "sha256",
+                "deadbeef",
+                "requests-1.0.whl",
+                "https://files.example/requests-1.0.whl",
+                "+files/root/pypi/+f/dea/dbeef/requests-1.0.whl",
+            )
+            .await
+            .unwrap();
+        cache
+            .mark_blob_ready(&BlobWrite {
+                blob_kind: "sha256".to_string(),
+                blob_id: "deadbeef".to_string(),
+                storage_relpath: "+files/root/pypi/+f/dea/dbeef/requests-1.0.whl".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                fetched_at: 2,
+                size_bytes: 1234,
+                filename: "requests-1.0.whl".to_string(),
+                upstream_url: "https://files.example/requests-1.0.whl".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let loaded = cache.load_project("requests").await.unwrap().unwrap();
+        assert_eq!(loaded.links[0].cached_size_bytes, Some(1234));
+        let summaries = cache.list_project_summaries().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].project, "requests");
+        assert_eq!(summaries[0].file_count, 1);
+        assert_eq!(summaries[0].cached_file_count, 1);
+        assert_eq!(summaries[0].cached_size_bytes, 1234);
     }
 
     #[tokio::test]

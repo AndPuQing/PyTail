@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "mkdir -p ../src/generated && tailwindcss -i ./src/styles.css -o ../src/generated/ui.css --minify && bun build ./src/main.ts --outfile ../src/generated/ui.js --target browser --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.7",
+    "tailwindcss": "^4.1.7",
+    "typescript": "^5.8.3"
+  }
+}

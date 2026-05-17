@@ -1,0 +1,1 @@
+document.addEventListener("DOMContentLoaded",()=>{let t=document.querySelector("#search");t?.addEventListener("submit",(u)=>{let n=t.querySelector("input[name=q]");if(!(n?.value.trim()??"")){u.preventDefault(),n?.focus();return}let e=t.querySelector("[type=submit]");if(e)if(e.disabled=!0,e instanceof HTMLInputElement)e.value="Opening...";else e.textContent="Opening..."})});

@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "workspaces": ["web"],
+  "scripts": {
+    "build:web": "cd web && bun run build"
+  }
+}

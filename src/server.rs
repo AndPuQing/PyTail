@@ -13,7 +13,7 @@ use crate::simple::{
 use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::{
     ACCEPT, ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, RANGE,
     WARNING,
@@ -333,18 +333,36 @@ async fn root_redirect() -> impl IntoResponse {
 
 async fn simple_root(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
+    if let Some(project) = query.get("q").map(|value| value.trim())
+        && !project.is_empty()
+    {
+        let normalized = normalize_project_name(project);
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::SEE_OTHER;
+        response
+            .headers_mut()
+            .insert(LOCATION, header(&format!("/simple/{normalized}/")));
+        return Ok(response);
+    }
+
     debug!("serving simple root");
-    let projects = state
-        .cache
-        .list_projects()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let format_json = wants_json(header_value(&headers, ACCEPT));
     let body = if format_json {
+        let projects = state
+            .cache
+            .list_projects()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         render_root_json(&projects)
     } else {
+        let projects = state
+            .cache
+            .list_project_summaries()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         render_root_html(&projects)
     };
     Ok(render_simple_response(
@@ -634,6 +652,7 @@ async fn ensure_project_with(
                         upstream_url: link.upstream_url,
                         blob_kind,
                         blob_id,
+                        cached_size_bytes: None,
                         requires_python: link.requires_python,
                         yanked: link.yanked,
                         gpg_sig: link.gpg_sig,
@@ -839,6 +858,7 @@ async fn ensure_metadata_blob(
         upstream_url,
         blob_kind,
         blob_id,
+        cached_size_bytes: None,
         requires_python: None,
         yanked: None,
         gpg_sig: None,
@@ -1714,6 +1734,7 @@ mod tests {
             upstream_url: format!("https://files.example/demo-{index}.whl"),
             blob_kind: "sha256".to_string(),
             blob_id: blob_id.clone(),
+            cached_size_bytes: None,
             requires_python: None,
             yanked: None,
             gpg_sig: None,
@@ -2124,6 +2145,33 @@ mod tests {
         let body = to_bytes(root.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("demo"));
+    }
+
+    #[tokio::test]
+    async fn search_query_redirects_to_normalized_project_page() {
+        let temp = tempdir().unwrap();
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            "https://example.invalid/simple/",
+        );
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/?q=My_Pkg.demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(LOCATION).unwrap(),
+            "/simple/my-pkg-demo/"
+        );
     }
 
     #[tokio::test]
