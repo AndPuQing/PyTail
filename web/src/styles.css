@@ -120,7 +120,7 @@
   }
 
   .sparkline {
-    @apply mt-2 block h-12 w-full overflow-visible;
+    @apply mt-2 block h-10 w-full overflow-visible;
   }
 
   .sparkline polyline {
@@ -130,6 +130,10 @@
     stroke-linecap: round;
     stroke-linejoin: round;
     vector-effect: non-scaling-stroke;
+  }
+
+  .trend-axis {
+    @apply mt-1 flex justify-between text-[0.6875rem] text-slate-400;
   }
 
   .project-grid {

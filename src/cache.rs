@@ -41,6 +41,14 @@ pub struct CacheSummary {
     pub cached_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RootHistorySample {
+    pub sampled_at: u64,
+    pub cached_size_bytes: u64,
+    pub package_count: u64,
+    pub hit_rate_percent: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectCache {
     pub project: String,
@@ -217,6 +225,79 @@ impl CacheStore {
                 },
             )
             .map_err(sqlite_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn record_root_stats_sample(&self, sample: RootHistorySample) -> io::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            conn.execute(
+                "INSERT INTO root_stats_samples (
+                    sampled_at, cached_size_bytes, package_count, hit_rate_percent
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(sampled_at) DO UPDATE SET
+                    cached_size_bytes = excluded.cached_size_bytes,
+                    package_count = excluded.package_count,
+                    hit_rate_percent = excluded.hit_rate_percent",
+                params![
+                    sample.sampled_at,
+                    sample.cached_size_bytes,
+                    sample.package_count,
+                    sample.hit_rate_percent,
+                ],
+            )
+            .map_err(sqlite_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn root_stats_history_since(&self, since: u64) -> io::Result<Vec<RootHistorySample>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sampled_at, cached_size_bytes, package_count, hit_rate_percent
+                     FROM root_stats_samples
+                     WHERE sampled_at >= ?1
+                     ORDER BY sampled_at",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map(params![since], |row| {
+                    Ok(RootHistorySample {
+                        sampled_at: row.get(0)?,
+                        cached_size_bytes: row.get(1)?,
+                        package_count: row.get(2)?,
+                        hit_rate_percent: row.get(3)?,
+                    })
+                })
+                .map_err(sqlite_error)?;
+            let mut samples = Vec::new();
+            for row in rows {
+                samples.push(row.map_err(sqlite_error)?);
+            }
+            Ok(samples)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn prune_root_stats_samples_before(&self, before: u64) -> io::Result<()> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_db(&db_path)?;
+            conn.execute(
+                "DELETE FROM root_stats_samples WHERE sampled_at < ?1",
+                params![before],
+            )
+            .map_err(sqlite_error)?;
+            Ok(())
         })
         .await
         .map_err(join_error)?
@@ -564,6 +645,13 @@ fn init_db(path: &Path) -> io::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_project_links_project_order
             ON project_links (project, position);
+
+        CREATE TABLE IF NOT EXISTS root_stats_samples (
+            sampled_at INTEGER PRIMARY KEY,
+            cached_size_bytes INTEGER NOT NULL,
+            package_count INTEGER NOT NULL,
+            hit_rate_percent REAL NOT NULL
+        );
         ",
     )
     .map_err(sqlite_error)?;
@@ -935,6 +1023,48 @@ mod tests {
         assert_eq!(summary.project_count, 1);
         assert_eq!(summary.ready_blob_count, 1);
         assert_eq!(summary.cached_size_bytes, 1234);
+    }
+
+    #[tokio::test]
+    async fn stores_and_loads_root_stats_history() {
+        let temp = tempdir().unwrap();
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+
+        cache
+            .record_root_stats_sample(RootHistorySample {
+                sampled_at: 100,
+                cached_size_bytes: 1024,
+                package_count: 1,
+                hit_rate_percent: 50.0,
+            })
+            .await
+            .unwrap();
+        cache
+            .record_root_stats_sample(RootHistorySample {
+                sampled_at: 200,
+                cached_size_bytes: 2048,
+                package_count: 2,
+                hit_rate_percent: 75.0,
+            })
+            .await
+            .unwrap();
+
+        let history = cache.root_stats_history_since(150).await.unwrap();
+        assert_eq!(
+            history,
+            vec![RootHistorySample {
+                sampled_at: 200,
+                cached_size_bytes: 2048,
+                package_count: 2,
+                hit_rate_percent: 75.0,
+            }]
+        );
+
+        cache.prune_root_stats_samples_before(200).await.unwrap();
+        let history = cache.root_stats_history_since(0).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sampled_at, 200);
     }
 
     #[tokio::test]

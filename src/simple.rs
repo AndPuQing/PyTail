@@ -1,4 +1,4 @@
-use crate::cache::{CachedLink, ProjectSummary};
+use crate::cache::{CachedLink, ProjectSummary, RootHistorySample};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -36,13 +36,6 @@ pub struct RootStats {
     pub blob_hits: u64,
     pub blob_misses: u64,
     pub history: Vec<RootHistorySample>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RootHistorySample {
-    pub cached_size_bytes: u64,
-    pub package_count: u64,
-    pub hit_rate_percent: f64,
 }
 
 pub fn normalize_project_name(name: &str) -> String {
@@ -276,20 +269,21 @@ fn push_root_trends(html: &mut String, stats: &RootStats) {
     if stats.history.is_empty() {
         return;
     }
+    let day_start = current_day_start(stats.history.last().map_or(0, |sample| sample.sampled_at));
     let cache_values = stats
         .history
         .iter()
-        .map(|sample| sample.cached_size_bytes as f64)
+        .map(|sample| (sample.sampled_at, sample.cached_size_bytes as f64))
         .collect::<Vec<_>>();
     let package_values = stats
         .history
         .iter()
-        .map(|sample| sample.package_count as f64)
+        .map(|sample| (sample.sampled_at, sample.package_count as f64))
         .collect::<Vec<_>>();
     let hit_rate_values = stats
         .history
         .iter()
-        .map(|sample| sample.hit_rate_percent)
+        .map(|sample| (sample.sampled_at, sample.hit_rate_percent))
         .collect::<Vec<_>>();
 
     html.push_str("        <section class=\"trend-grid\" aria-label=\"Cache trends\">\n");
@@ -297,24 +291,33 @@ fn push_root_trends(html: &mut String, stats: &RootStats) {
         html,
         "Hit rate",
         &format!("{:.1}%", combined_hit_rate(stats)),
+        day_start,
         &hit_rate_values,
     );
     push_trend_card(
         html,
         "Cache size",
         &format_size(stats.cached_size_bytes),
+        day_start,
         &cache_values,
     );
     push_trend_card(
         html,
         "Packages",
         &stats.package_count.to_string(),
+        day_start,
         &package_values,
     );
     html.push_str("        </section>\n");
 }
 
-fn push_trend_card(html: &mut String, label: &str, value: &str, values: &[f64]) {
+fn push_trend_card(
+    html: &mut String,
+    label: &str,
+    value: &str,
+    day_start: u64,
+    values: &[(u64, f64)],
+) {
     html.push_str("          <div class=\"trend-card\"><div class=\"trend-head\"><span class=\"trend-label\">");
     html.push_str(&escape_html(label));
     html.push_str("</span><strong class=\"trend-value\">");
@@ -324,35 +327,45 @@ fn push_trend_card(html: &mut String, label: &str, value: &str, values: &[f64]) 
     );
     html.push_str(&escape_html_attr(label));
     html.push_str(" trend\" preserveAspectRatio=\"none\"><polyline points=\"");
-    html.push_str(&sparkline_points(values));
-    html.push_str("\" /></svg></div>\n");
+    html.push_str(&sparkline_points(day_start, values));
+    html.push_str(
+        "\" /></svg><div class=\"trend-axis\"><span>00:00</span><span>24:00</span></div></div>\n",
+    );
 }
 
-fn sparkline_points(values: &[f64]) -> String {
+fn sparkline_points(day_start: u64, values: &[(u64, f64)]) -> String {
     if values.is_empty() {
         return String::new();
     }
-    if values.len() == 1 {
-        return "0,20 100,20".to_string();
-    }
 
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = values
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(f64::INFINITY, f64::min);
+    let max = values
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(f64::NEG_INFINITY, f64::max);
     let range = (max - min).max(1.0);
-    let width = 100.0;
     let height = 32.0;
     let top = 4.0;
-    let last = values.len() - 1;
+    let day_end = day_start + 24 * 60 * 60;
     values
         .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let x = index as f64 * width / last as f64;
+        .map(|(sampled_at, value)| {
+            let elapsed = sampled_at
+                .saturating_sub(day_start)
+                .min(day_end - day_start);
+            let x = elapsed as f64 * 100.0 / (day_end - day_start) as f64;
             let y = top + height - ((*value - min) / range * height);
             format!("{x:.1},{y:.1}")
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn current_day_start(timestamp: u64) -> u64 {
+    timestamp - timestamp % (24 * 60 * 60)
 }
 
 fn push_stat(html: &mut String, label: &str, value: &str) {
@@ -818,11 +831,13 @@ mod tests {
                 blob_misses: 3,
                 history: vec![
                     RootHistorySample {
+                        sampled_at: 1_700_006_000,
                         cached_size_bytes: 1024,
                         package_count: 1,
                         hit_rate_percent: 50.0,
                     },
                     RootHistorySample {
+                        sampled_at: 1_700_012_000,
                         cached_size_bytes: 4096,
                         package_count: 2,
                         hit_rate_percent: 70.0,

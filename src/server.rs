@@ -1,14 +1,14 @@
 use crate::cache::{
     BlobInfo, BlobStatus, BlobWrite, CacheStore, CachedLink, ProjectCache, ProjectRecord,
-    current_unix_secs, fallback_blob_identity, hash_blob_identity,
+    RootHistorySample, current_unix_secs, fallback_blob_identity, hash_blob_identity,
 };
 use crate::config::AppConfig;
 use crate::hot_cache::BoundedLruCache;
 use crate::range::parse_byte_range;
 use crate::simple::{
-    RootHistorySample, RootStats, json_media_type, normalize_project_name,
-    parse_project_json_links, parse_project_links, render_project_html_with_file_base,
-    render_project_json_with_file_base, render_root_html, render_root_json, wants_json,
+    RootStats, json_media_type, normalize_project_name, parse_project_json_links,
+    parse_project_links, render_project_html_with_file_base, render_project_json_with_file_base,
+    render_root_html, render_root_json, wants_json,
 };
 use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient};
 use axum::Router;
@@ -26,7 +26,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -53,14 +53,12 @@ struct AppState {
     hot_projects: HotProjectCache,
     hot_links: HotLinkCache,
     hot_blobs: HotBlobCache,
-    root_stats_history: RootStatsHistory,
 }
 
 type ActiveBlobRegistry = Arc<Mutex<HashMap<String, Arc<ActiveBlob>>>>;
 type HotProjectCache = Arc<RwLock<BoundedLruCache<String, HotProject>>>;
 type HotLinkCache = Arc<RwLock<BoundedLruCache<String, CachedLink>>>;
 type HotBlobCache = Arc<RwLock<BoundedLruCache<String, BlobInfo>>>;
-type RootStatsHistory = Arc<RwLock<VecDeque<RootHistorySample>>>;
 type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type Counter = Arc<AtomicU64>;
 
@@ -68,7 +66,7 @@ const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
 const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
 const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
-const ROOT_STATS_HISTORY_MAX_SAMPLES: usize = 120;
+const ROOT_STATS_HISTORY_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const PYPI_FILE_BASE_PATH: &str = "/root/pypi/+f";
 const PYTORCH_WHEELS_FILE_BASE_PATH: &str = "/pytorch-wheels/+f";
 
@@ -237,14 +235,12 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
             HOT_BLOB_CACHE_MAX_ENTRIES,
         ))),
-        root_stats_history: RootStatsHistory::default(),
     };
     if config.stats_interval_secs > 0 {
         spawn_cache_stats_logger(state.metrics.clone(), config.stats_interval_secs);
         spawn_root_stats_sampler(
             state.cache.clone(),
             state.metrics.clone(),
-            state.root_stats_history.clone(),
             config.stats_interval_secs,
         );
     }
@@ -294,12 +290,7 @@ fn log_cache_stats(scope: &str, snapshot: CacheMetricsSnapshot) {
     );
 }
 
-fn spawn_root_stats_sampler(
-    cache: CacheStore,
-    metrics: CacheMetrics,
-    history: RootStatsHistory,
-    interval_secs: u64,
-) {
+fn spawn_root_stats_sampler(cache: CacheStore, metrics: CacheMetrics, interval_secs: u64) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
@@ -309,15 +300,19 @@ fn spawn_root_stats_sampler(
                 continue;
             };
             let metrics = metrics.snapshot();
-            push_root_stats_sample(
-                &history,
+            if let Err(err) = record_root_stats_sample(
+                &cache,
                 RootHistorySample {
+                    sampled_at: current_unix_secs(),
                     cached_size_bytes: cache_summary.cached_size_bytes,
                     package_count: cache_summary.project_count,
                     hit_rate_percent: combined_hit_rate(&metrics),
                 },
             )
-            .await;
+            .await
+            {
+                warn!(error = %err, "failed to record root stats sample");
+            }
         }
     });
 }
@@ -336,23 +331,12 @@ fn combined_hit_rate(snapshot: &CacheMetricsSnapshot) -> f64 {
     hit_rate(hits, hits + misses)
 }
 
-async fn record_root_stats_sample(
-    state: &AppState,
-    sample: RootHistorySample,
-) -> Vec<RootHistorySample> {
-    push_root_stats_sample(&state.root_stats_history, sample).await
-}
-
-async fn push_root_stats_sample(
-    history: &RootStatsHistory,
-    sample: RootHistorySample,
-) -> Vec<RootHistorySample> {
-    let mut history = history.write().await;
-    history.push_back(sample);
-    while history.len() > ROOT_STATS_HISTORY_MAX_SAMPLES {
-        history.pop_front();
-    }
-    history.iter().copied().collect()
+async fn record_root_stats_sample(cache: &CacheStore, sample: RootHistorySample) -> io::Result<()> {
+    cache.record_root_stats_sample(sample).await?;
+    let cutoff = sample
+        .sampled_at
+        .saturating_sub(ROOT_STATS_HISTORY_MAX_AGE_SECS);
+    cache.prune_root_stats_samples_before(cutoff).await
 }
 
 fn app(state: AppState) -> Router {
@@ -432,15 +416,23 @@ async fn simple_root(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let metrics = state.metrics.snapshot();
-        let history = record_root_stats_sample(
-            &state,
+        let sampled_at = current_unix_secs();
+        record_root_stats_sample(
+            &state.cache,
             RootHistorySample {
+                sampled_at,
                 cached_size_bytes: cache_summary.cached_size_bytes,
                 package_count: cache_summary.project_count,
                 hit_rate_percent: combined_hit_rate(&metrics),
             },
         )
-        .await;
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let history = state
+            .cache
+            .root_stats_history_since(sampled_at.saturating_sub(ROOT_STATS_HISTORY_MAX_AGE_SECS))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         render_root_html(
             &projects,
             RootStats {
@@ -1913,7 +1905,6 @@ mod tests {
             hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
                 HOT_BLOB_CACHE_MAX_ENTRIES,
             ))),
-            root_stats_history: RootStatsHistory::default(),
         }
     }
 
