@@ -47,6 +47,7 @@ struct AppState {
     cache: CacheStore,
     upstream: UpstreamClient,
     pytorch_wheels_upstream: UpstreamClient,
+    pytorch_channel_upstreams: Arc<DashMap<String, UpstreamClient>>,
     request_timeout_secs: u64,
     project_cache_ttl_secs: u64,
     locks: RequestLocks,
@@ -222,6 +223,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
             &config.pytorch_wheels_upstream_base_url,
             config.request_timeout_secs,
         )?,
+        pytorch_channel_upstreams: Arc::new(DashMap::new()),
         request_timeout_secs: config.request_timeout_secs,
         project_cache_ttl_secs: config.project_cache_ttl_secs,
         locks: RequestLocks::default(),
@@ -434,45 +436,26 @@ async fn simple_root(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         render_root_json(&projects)
     } else {
-        let projects = state
-            .cache
-            .list_project_summaries()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let cache_summary = state
-            .cache
-            .cache_summary()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let metrics = state.metrics.snapshot();
         let sampled_at = current_unix_secs();
-        record_root_stats_sample(
-            &state.cache,
-            RootHistorySample {
-                sampled_at,
-                cached_size_bytes: cache_summary.cached_size_bytes,
-                package_count: cache_summary.project_count,
-                hit_rate_percent: combined_hit_rate(&metrics),
-            },
-        )
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let history = state
+        let snapshot = state
             .cache
-            .root_stats_history_since(sampled_at.saturating_sub(ROOT_STATS_HISTORY_MAX_AGE_SECS))
+            .root_dashboard_snapshot_since(
+                sampled_at.saturating_sub(ROOT_STATS_HISTORY_MAX_AGE_SECS),
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         render_root_html(
-            &projects,
+            &snapshot.projects,
             RootStats {
-                cached_size_bytes: cache_summary.cached_size_bytes,
-                cached_file_count: cache_summary.ready_blob_count,
-                package_count: cache_summary.project_count,
+                cached_size_bytes: snapshot.cache_summary.cached_size_bytes,
+                cached_file_count: snapshot.cache_summary.ready_blob_count,
+                package_count: snapshot.cache_summary.project_count,
                 project_hits: metrics.project_hits,
                 project_misses: metrics.project_misses,
                 blob_hits: metrics.blob_hits,
                 blob_misses: metrics.blob_misses,
-                history,
+                history: snapshot.history,
             },
         )
     };
@@ -550,10 +533,7 @@ async fn pytorch_wheels_channel_project(
     let normalized = normalize_project_name(&project);
     let cache_project = pytorch_wheels_cache_project(Some(&channel), &normalized);
     let file_base_path = pytorch_wheels_channel_file_base_path(&channel);
-    let upstream = match state
-        .pytorch_wheels_upstream
-        .child_project_root(&channel, state.request_timeout_secs)
-    {
+    let upstream = match pytorch_channel_upstream(&state, &channel) {
         Ok(upstream) => upstream,
         Err(_) => {
             return text_response(StatusCode::INTERNAL_SERVER_ERROR, "upstream unavailable\n");
@@ -890,6 +870,22 @@ fn pytorch_wheels_cache_project(channel: Option<&str>, project: &str) -> String 
 
 fn pytorch_wheels_channel_file_base_path(channel: &str) -> String {
     format!("/pytorch-wheels/{channel}/+f")
+}
+
+fn pytorch_channel_upstream(
+    state: &AppState,
+    channel: &str,
+) -> Result<UpstreamClient, std::io::Error> {
+    if let Some(upstream) = state.pytorch_channel_upstreams.get(channel) {
+        return Ok(upstream.clone());
+    }
+    let upstream = state
+        .pytorch_wheels_upstream
+        .child_project_root(channel, state.request_timeout_secs)?;
+    state
+        .pytorch_channel_upstreams
+        .insert(channel.to_string(), upstream.clone());
+    Ok(upstream)
 }
 
 async fn ensure_blob(
@@ -1909,6 +1905,7 @@ mod tests {
                 5,
             )
             .unwrap(),
+            pytorch_channel_upstreams: Arc::new(DashMap::new()),
             request_timeout_secs: 5,
             project_cache_ttl_secs: 3600,
             locks: RequestLocks::default(),

@@ -29,6 +29,11 @@ name = "hot_path_bench"
 path = "src/bin/hot_path_bench.rs"
 required-features = ["bench-tools"]
 
+[[bin]]
+name = "root_summary_bench"
+path = "src/bin/root_summary_bench.rs"
+required-features = ["bench-tools"]
+
 [dependencies]
 axum = "0.8"
 bytes = "1"

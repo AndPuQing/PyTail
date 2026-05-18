@@ -2,6 +2,8 @@ use crate::simple::normalize_project_name;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +11,10 @@ use tokio::fs;
 
 const BLOB_STATE_PENDING: &str = "pending";
 const BLOB_STATE_READY: &str = "ready";
+
+thread_local! {
+    static SQLITE_CONNECTIONS: RefCell<HashMap<PathBuf, Connection>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CachedLink {
@@ -41,6 +47,13 @@ pub struct CacheSummary {
     pub project_count: u64,
     pub ready_blob_count: u64,
     pub cached_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootDashboardSnapshot {
+    pub projects: Vec<ProjectSummary>,
+    pub cache_summary: CacheSummary,
+    pub history: Vec<RootHistorySample>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -129,111 +142,38 @@ impl CacheStore {
 
     pub async fn list_projects(&self) -> io::Result<Vec<String>> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            let mut stmt = conn
-                .prepare("SELECT project FROM projects ORDER BY project")
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(sqlite_error)?;
-            let mut projects = Vec::new();
-            for row in rows {
-                projects.push(row.map_err(sqlite_error)?);
-            }
-            Ok(projects)
-        })
-        .await
-        .map_err(join_error)?
+        tokio::task::spawn_blocking(move || with_db(&db_path, list_projects_db))
+            .await
+            .map_err(join_error)?
     }
 
     pub async fn list_project_summaries(&self) -> io::Result<Vec<ProjectSummary>> {
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT
-                        p.project,
-                        p.upstream_project_url,
-                        COUNT(pl.position) AS file_count,
-                        COALESCE((
-                            SELECT COUNT(*)
-                            FROM (
-                                SELECT DISTINCT pl2.blob_kind, pl2.blob_id
-                                FROM project_links pl2
-                                JOIN blobs b2
-                                  ON b2.blob_kind = pl2.blob_kind
-                                 AND b2.blob_id = pl2.blob_id
-                                 AND b2.state = 'ready'
-                                WHERE pl2.project = p.project
-                            )
-                        ), 0) AS cached_file_count,
-                        COALESCE((
-                            SELECT SUM(size_bytes)
-                            FROM (
-                                SELECT DISTINCT b3.blob_kind, b3.blob_id, b3.size_bytes
-                                FROM project_links pl3
-                                JOIN blobs b3
-                                  ON b3.blob_kind = pl3.blob_kind
-                                 AND b3.blob_id = pl3.blob_id
-                                 AND b3.state = 'ready'
-                                WHERE pl3.project = p.project
-                            )
-                        ), 0) AS cached_size_bytes
-                     FROM projects p
-                     LEFT JOIN project_links pl ON pl.project = p.project
-                     GROUP BY p.project, p.upstream_project_url
-                     ORDER BY p.project",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let project = row.get::<_, String>(0)?;
-                    let upstream_project_url = row.get::<_, String>(1)?;
-                    let (display_name, page_url) =
-                        project_summary_link(&project, &upstream_project_url);
-                    Ok(ProjectSummary {
-                        project,
-                        display_name,
-                        page_url,
-                        file_count: row.get(2)?,
-                        cached_file_count: row.get(3)?,
-                        cached_size_bytes: row.get(4)?,
-                    })
-                })
-                .map_err(sqlite_error)?;
-            let mut projects = Vec::new();
-            for row in rows {
-                projects.push(row.map_err(sqlite_error)?);
-            }
-            Ok(projects)
-        })
-        .await
-        .map_err(join_error)?
+        tokio::task::spawn_blocking(move || with_db(&db_path, list_project_summaries_db))
+            .await
+            .map_err(join_error)?
     }
 
     pub async fn cache_summary(&self) -> io::Result<CacheSummary> {
         let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || with_db(&db_path, cache_summary_db))
+            .await
+            .map_err(join_error)?
+    }
+
+    pub async fn root_dashboard_snapshot_since(
+        &self,
+        history_since: u64,
+    ) -> io::Result<RootDashboardSnapshot> {
+        let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            conn.query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM projects),
-                    COUNT(*),
-                    COALESCE(SUM(size_bytes), 0)
-                 FROM blobs
-                 WHERE state = 'ready'",
-                [],
-                |row| {
-                    Ok(CacheSummary {
-                        project_count: row.get(0)?,
-                        ready_blob_count: row.get(1)?,
-                        cached_size_bytes: row.get(2)?,
-                    })
-                },
-            )
-            .map_err(sqlite_error)
+            with_db(&db_path, |conn| {
+                Ok(RootDashboardSnapshot {
+                    projects: list_project_summaries_db(conn)?,
+                    cache_summary: cache_summary_db(conn)?,
+                    history: root_stats_history_since_db(conn, history_since)?,
+                })
+            })
         })
         .await
         .map_err(join_error)?
@@ -242,24 +182,25 @@ impl CacheStore {
     pub async fn record_root_stats_sample(&self, sample: RootHistorySample) -> io::Result<()> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            conn.execute(
-                "INSERT INTO root_stats_samples (
+            with_db(&db_path, |conn| {
+                conn.execute(
+                    "INSERT INTO root_stats_samples (
                     sampled_at, cached_size_bytes, package_count, hit_rate_percent
                  ) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(sampled_at) DO UPDATE SET
                     cached_size_bytes = excluded.cached_size_bytes,
                     package_count = excluded.package_count,
                     hit_rate_percent = excluded.hit_rate_percent",
-                params![
-                    sample.sampled_at,
-                    sample.cached_size_bytes,
-                    sample.package_count,
-                    sample.hit_rate_percent,
-                ],
-            )
-            .map_err(sqlite_error)?;
-            Ok(())
+                    params![
+                        sample.sampled_at,
+                        sample.cached_size_bytes,
+                        sample.package_count,
+                        sample.hit_rate_percent,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                Ok(())
+            })
         })
         .await
         .map_err(join_error)?
@@ -268,30 +209,7 @@ impl CacheStore {
     pub async fn root_stats_history_since(&self, since: u64) -> io::Result<Vec<RootHistorySample>> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT sampled_at, cached_size_bytes, package_count, hit_rate_percent
-                     FROM root_stats_samples
-                     WHERE sampled_at >= ?1
-                     ORDER BY sampled_at",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(params![since], |row| {
-                    Ok(RootHistorySample {
-                        sampled_at: row.get(0)?,
-                        cached_size_bytes: row.get(1)?,
-                        package_count: row.get(2)?,
-                        hit_rate_percent: row.get(3)?,
-                    })
-                })
-                .map_err(sqlite_error)?;
-            let mut samples = Vec::new();
-            for row in rows {
-                samples.push(row.map_err(sqlite_error)?);
-            }
-            Ok(samples)
+            with_db(&db_path, |conn| root_stats_history_since_db(conn, since))
         })
         .await
         .map_err(join_error)?
@@ -300,13 +218,14 @@ impl CacheStore {
     pub async fn prune_root_stats_samples_before(&self, before: u64) -> io::Result<()> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            conn.execute(
-                "DELETE FROM root_stats_samples WHERE sampled_at < ?1",
-                params![before],
-            )
-            .map_err(sqlite_error)?;
-            Ok(())
+            with_db(&db_path, |conn| {
+                conn.execute(
+                    "DELETE FROM root_stats_samples WHERE sampled_at < ?1",
+                    params![before],
+                )
+                .map_err(sqlite_error)?;
+                Ok(())
+            })
         })
         .await
         .map_err(join_error)?
@@ -337,13 +256,14 @@ impl CacheStore {
         let db_path = self.db_path.clone();
         let project = normalize_project_name(project);
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            conn.execute(
-                "UPDATE projects SET fetched_at = ?2, expires_at = ?3 WHERE project = ?1",
-                params![project, fetched_at, expires_at],
-            )
-            .map_err(sqlite_error)?;
-            Ok(())
+            with_db(&db_path, |conn| {
+                conn.execute(
+                    "UPDATE projects SET fetched_at = ?2, expires_at = ?3 WHERE project = ?1",
+                    params![project, fetched_at, expires_at],
+                )
+                .map_err(sqlite_error)?;
+                Ok(())
+            })
         })
         .await
         .map_err(join_error)?
@@ -369,26 +289,26 @@ impl CacheStore {
         let route_b = route_b.to_string();
         let filename = filename.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            if route_a == "_url" {
-                return query_link_by_blob(
-                    &conn,
-                    "SELECT filename, upstream_url, blob_kind, blob_id, requires_python, yanked, gpg_sig,
+            with_db(&db_path, |conn| {
+                if route_a == "_url" {
+                    return query_link_by_blob(
+                        conn,
+                        "SELECT filename, upstream_url, blob_kind, blob_id, requires_python, yanked, gpg_sig,
                             dist_info_metadata, core_metadata, hash_name, hash_value
                      FROM project_links
                      WHERE blob_kind = 'url' AND blob_id = ?1 AND filename = ?2
                      LIMIT 1",
-                    params![route_b, filename],
-                );
-            }
+                        params![route_b, filename],
+                    );
+                }
 
-            let prefix = format!("{route_a}{route_b}");
-            let Some(prefix_end) = next_lexicographic_prefix(&prefix) else {
-                return Ok(None);
-            };
-            query_link_by_blob(
-                &conn,
-                "SELECT filename, upstream_url, blob_kind, blob_id, requires_python, yanked, gpg_sig,
+                let prefix = format!("{route_a}{route_b}");
+                let Some(prefix_end) = next_lexicographic_prefix(&prefix) else {
+                    return Ok(None);
+                };
+                query_link_by_blob(
+                    conn,
+                    "SELECT filename, upstream_url, blob_kind, blob_id, requires_python, yanked, gpg_sig,
                         dist_info_metadata, core_metadata, hash_name, hash_value
                  FROM project_links
                  WHERE blob_kind = 'sha256'
@@ -396,8 +316,9 @@ impl CacheStore {
                    AND blob_id < ?2
                    AND filename = ?3
                  LIMIT 1",
-                params![prefix, prefix_end, filename],
-            )
+                    params![prefix, prefix_end, filename],
+                )
+            })
         })
         .await
         .map_err(join_error)?
@@ -418,24 +339,25 @@ impl CacheStore {
         let upstream_url = upstream_url.to_string();
         let storage_relpath = storage_relpath.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            let inserted = conn
-                .execute(
-                    "INSERT OR IGNORE INTO blobs (
+            with_db(&db_path, |conn| {
+                let inserted = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO blobs (
                     blob_kind, blob_id, storage_relpath, content_type, fetched_at, size_bytes,
                     filename, upstream_url, state
                  ) VALUES (?1, ?2, ?3, '', 0, 0, ?4, ?5, ?6)",
-                    params![
-                        blob_kind,
-                        blob_id,
-                        storage_relpath,
-                        filename,
-                        upstream_url,
-                        BLOB_STATE_PENDING
-                    ],
-                )
-                .map_err(sqlite_error)?;
-            Ok(inserted == 1)
+                        params![
+                            blob_kind,
+                            blob_id,
+                            storage_relpath,
+                            filename,
+                            upstream_url,
+                            BLOB_STATE_PENDING
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                Ok(inserted == 1)
+            })
         })
         .await
         .map_err(join_error)?
@@ -491,9 +413,9 @@ impl CacheStore {
         let db_path = self.db_path.clone();
         let blob = blob.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_db(&db_path)?;
-            conn.execute(
-                "UPDATE blobs
+            with_db(&db_path, |conn| {
+                conn.execute(
+                    "UPDATE blobs
                  SET storage_relpath = ?3,
                      content_type = ?4,
                      fetched_at = ?5,
@@ -502,29 +424,30 @@ impl CacheStore {
                      upstream_url = ?8,
                      state = ?9
                  WHERE blob_kind = ?1 AND blob_id = ?2",
-                params![
-                    blob.blob_kind,
-                    blob.blob_id,
-                    blob.storage_relpath,
-                    blob.content_type,
-                    blob.fetched_at,
-                    blob.size_bytes,
-                    blob.filename,
-                    blob.upstream_url,
-                    BLOB_STATE_READY,
-                ],
-            )
-            .map_err(sqlite_error)?;
-            Ok(BlobInfo {
-                blob_kind: blob.blob_kind,
-                blob_id: blob.blob_id,
-                storage_relpath: blob.storage_relpath,
-                content_type: blob.content_type,
-                fetched_at: blob.fetched_at,
-                size_bytes: blob.size_bytes,
-                filename: blob.filename,
-                upstream_url: blob.upstream_url,
-                state: BLOB_STATE_READY.to_string(),
+                    params![
+                        blob.blob_kind,
+                        blob.blob_id,
+                        blob.storage_relpath,
+                        blob.content_type,
+                        blob.fetched_at,
+                        blob.size_bytes,
+                        blob.filename,
+                        blob.upstream_url,
+                        BLOB_STATE_READY,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                Ok(BlobInfo {
+                    blob_kind: blob.blob_kind,
+                    blob_id: blob.blob_id,
+                    storage_relpath: blob.storage_relpath,
+                    content_type: blob.content_type,
+                    fetched_at: blob.fetched_at,
+                    size_bytes: blob.size_bytes,
+                    filename: blob.filename,
+                    upstream_url: blob.upstream_url,
+                    state: BLOB_STATE_READY.to_string(),
+                })
             })
         })
         .await
@@ -599,6 +522,134 @@ fn project_summary_link(project: &str, upstream_project_url: &str) -> (String, S
         );
     }
     (project.to_string(), format!("{project}/"))
+}
+
+fn list_projects_db(conn: &mut Connection) -> io::Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT project FROM projects ORDER BY project")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_error)?;
+    let mut projects = Vec::new();
+    for row in rows {
+        projects.push(row.map_err(sqlite_error)?);
+    }
+    Ok(projects)
+}
+
+fn list_project_summaries_db(conn: &mut Connection) -> io::Result<Vec<ProjectSummary>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH
+                project_file_counts AS (
+                    SELECT project, COUNT(position) AS file_count
+                    FROM project_links
+                    GROUP BY project
+                ),
+                ready_project_blobs AS (
+                    SELECT
+                        pl.project,
+                        b.blob_kind,
+                        b.blob_id,
+                        MAX(b.size_bytes) AS size_bytes
+                    FROM project_links pl
+                    JOIN blobs b
+                      ON b.blob_kind = pl.blob_kind
+                     AND b.blob_id = pl.blob_id
+                     AND b.state = 'ready'
+                    GROUP BY pl.project, b.blob_kind, b.blob_id
+                ),
+                ready_project_totals AS (
+                    SELECT
+                        project,
+                        COUNT(*) AS cached_file_count,
+                        COALESCE(SUM(size_bytes), 0) AS cached_size_bytes
+                    FROM ready_project_blobs
+                    GROUP BY project
+                )
+             SELECT
+                 p.project,
+                 p.upstream_project_url,
+                 COALESCE(pfc.file_count, 0) AS file_count,
+                 COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
+                 COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
+             FROM projects p
+             LEFT JOIN project_file_counts pfc ON pfc.project = p.project
+             LEFT JOIN ready_project_totals rpt ON rpt.project = p.project
+             ORDER BY p.project",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let project = row.get::<_, String>(0)?;
+            let upstream_project_url = row.get::<_, String>(1)?;
+            let (display_name, page_url) = project_summary_link(&project, &upstream_project_url);
+            Ok(ProjectSummary {
+                project,
+                display_name,
+                page_url,
+                file_count: row.get(2)?,
+                cached_file_count: row.get(3)?,
+                cached_size_bytes: row.get(4)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    let mut projects = Vec::new();
+    for row in rows {
+        projects.push(row.map_err(sqlite_error)?);
+    }
+    Ok(projects)
+}
+
+fn cache_summary_db(conn: &mut Connection) -> io::Result<CacheSummary> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT
+                (SELECT COUNT(*) FROM projects),
+                COUNT(*),
+                COALESCE(SUM(size_bytes), 0)
+             FROM blobs
+             WHERE state = 'ready'",
+        )
+        .map_err(sqlite_error)?;
+    stmt.query_row([], |row| {
+        Ok(CacheSummary {
+            project_count: row.get(0)?,
+            ready_blob_count: row.get(1)?,
+            cached_size_bytes: row.get(2)?,
+        })
+    })
+    .map_err(sqlite_error)
+}
+
+fn root_stats_history_since_db(
+    conn: &mut Connection,
+    since: u64,
+) -> io::Result<Vec<RootHistorySample>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT sampled_at, cached_size_bytes, package_count, hit_rate_percent
+             FROM root_stats_samples
+             WHERE sampled_at >= ?1
+             ORDER BY sampled_at",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok(RootHistorySample {
+                sampled_at: row.get(0)?,
+                cached_size_bytes: row.get(1)?,
+                package_count: row.get(2)?,
+                hit_rate_percent: row.get(3)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    let mut samples = Vec::new();
+    for row in rows {
+        samples.push(row.map_err(sqlite_error)?);
+    }
+    Ok(samples)
 }
 
 pub fn fallback_blob_identity(upstream_url: &str) -> (String, String) {
@@ -682,6 +733,9 @@ fn init_db(path: &Path) -> io::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_project_links_project_order
             ON project_links (project, position);
 
+        CREATE INDEX IF NOT EXISTS idx_blobs_state_size
+            ON blobs (state, size_bytes);
+
         CREATE TABLE IF NOT EXISTS root_stats_samples (
             sampled_at INTEGER PRIMARY KEY,
             cached_size_bytes INTEGER NOT NULL,
@@ -701,6 +755,7 @@ fn open_db(path: &Path) -> io::Result<Connection> {
     conn.execute_batch(
         "
         PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
         PRAGMA temp_store=MEMORY;
         ",
     )
@@ -708,14 +763,30 @@ fn open_db(path: &Path) -> io::Result<Connection> {
     Ok(conn)
 }
 
+fn with_db<T>(path: &Path, op: impl FnOnce(&mut Connection) -> io::Result<T>) -> io::Result<T> {
+    SQLITE_CONNECTIONS.with(|connections| {
+        let mut connections = connections.borrow_mut();
+        let key = path.to_path_buf();
+        if !connections.contains_key(&key) {
+            connections.insert(key.clone(), open_db(path)?);
+        }
+        let conn = connections
+            .get_mut(&key)
+            .expect("thread-local sqlite connection was just inserted");
+        op(conn)
+    })
+}
+
 fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache>> {
-    let conn = open_db(path)?;
-    let row = conn
-        .query_row(
+    with_db(path, |conn| {
+        let mut project_stmt = conn
+            .prepare_cached(
             "SELECT fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url, raw_body
              FROM projects WHERE project = ?1",
-            params![project],
-            |row| {
+            )
+            .map_err(sqlite_error)?;
+        let row = project_stmt
+            .query_row(params![project], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
                     row.get::<_, u64>(1)?,
@@ -724,78 +795,77 @@ fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                 ))
-            },
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let Some((
-        fetched_at,
-        expires_at,
-        upstream_etag,
-        upstream_serial,
-        upstream_project_url,
-        raw_body,
-    )) = row
-    else {
-        return Ok(None);
-    };
+            })
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some((
+            fetched_at,
+            expires_at,
+            upstream_etag,
+            upstream_serial,
+            upstream_project_url,
+            raw_body,
+        )) = row
+        else {
+            return Ok(None);
+        };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT pl.filename, pl.upstream_url, pl.blob_kind, pl.blob_id,
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT pl.filename, pl.upstream_url, pl.blob_kind, pl.blob_id,
                     (
                         SELECT b.size_bytes
                         FROM blobs b
                         WHERE b.blob_kind = pl.blob_kind
                           AND b.blob_id = pl.blob_id
                           AND b.state = 'ready'
-                        LIMIT 1
                     ) AS cached_size_bytes,
                     pl.requires_python, pl.yanked, pl.gpg_sig,
                     pl.dist_info_metadata, pl.core_metadata, pl.hash_name, pl.hash_value
              FROM project_links pl
              WHERE pl.project = ?1
              ORDER BY pl.position",
-        )
-        .map_err(sqlite_error)?;
-    let rows = stmt
-        .query_map(params![project], |row| {
-            Ok(CachedLink {
-                filename: row.get(0)?,
-                upstream_url: row.get(1)?,
-                blob_kind: row.get(2)?,
-                blob_id: row.get(3)?,
-                cached_size_bytes: row.get(4)?,
-                requires_python: row.get(5)?,
-                yanked: row.get(6)?,
-                gpg_sig: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
-                dist_info_metadata: row.get(8)?,
-                core_metadata: row.get(9)?,
-                hash_name: row.get(10)?,
-                hash_value: row.get(11)?,
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(params![project], |row| {
+                Ok(CachedLink {
+                    filename: row.get(0)?,
+                    upstream_url: row.get(1)?,
+                    blob_kind: row.get(2)?,
+                    blob_id: row.get(3)?,
+                    cached_size_bytes: row.get(4)?,
+                    requires_python: row.get(5)?,
+                    yanked: row.get(6)?,
+                    gpg_sig: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+                    dist_info_metadata: row.get(8)?,
+                    core_metadata: row.get(9)?,
+                    hash_name: row.get(10)?,
+                    hash_value: row.get(11)?,
+                })
             })
-        })
-        .map_err(sqlite_error)?;
-    let mut links = Vec::new();
-    for row in rows {
-        links.push(row.map_err(sqlite_error)?);
-    }
-    Ok(Some(ProjectCache {
-        project: project.to_string(),
-        fetched_at,
-        expires_at,
-        upstream_etag,
-        upstream_serial,
-        upstream_project_url,
-        raw_body,
-        links,
-    }))
+            .map_err(sqlite_error)?;
+        let mut links = Vec::new();
+        for row in rows {
+            links.push(row.map_err(sqlite_error)?);
+        }
+        Ok(Some(ProjectCache {
+            project: project.to_string(),
+            fetched_at,
+            expires_at,
+            upstream_etag,
+            upstream_serial,
+            upstream_project_url,
+            raw_body,
+            links,
+        }))
+    })
 }
 
 fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCache> {
-    let mut conn = open_db(path)?;
-    let tx = conn.transaction().map_err(sqlite_error)?;
-    tx.execute(
+    with_db(path, |conn| {
+        let tx = conn.transaction().map_err(sqlite_error)?;
+        tx.execute(
         "INSERT INTO projects (
             project, fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url, raw_body
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -817,13 +887,13 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
         ],
     )
     .map_err(sqlite_error)?;
-    tx.execute(
-        "DELETE FROM project_links WHERE project = ?1",
-        params![record.project],
-    )
-    .map_err(sqlite_error)?;
-    {
-        let mut insert_link = tx
+        tx.execute(
+            "DELETE FROM project_links WHERE project = ?1",
+            params![record.project],
+        )
+        .map_err(sqlite_error)?;
+        {
+            let mut insert_link = tx
             .prepare(
                 "INSERT INTO project_links (
                 project, position, filename, upstream_url, blob_kind, blob_id,
@@ -831,48 +901,51 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )
             .map_err(sqlite_error)?;
-        for (position, link) in record.links.iter().enumerate() {
-            insert_link
-                .execute(params![
-                    record.project,
-                    position as i64,
-                    link.filename,
-                    link.upstream_url,
-                    link.blob_kind,
-                    link.blob_id,
-                    link.requires_python,
-                    link.yanked,
-                    link.gpg_sig.map(|value| if value { 1 } else { 0 }),
-                    link.dist_info_metadata,
-                    link.core_metadata,
-                    link.hash_name,
-                    link.hash_value,
-                ])
-                .map_err(sqlite_error)?;
+            for (position, link) in record.links.iter().enumerate() {
+                insert_link
+                    .execute(params![
+                        record.project,
+                        position as i64,
+                        link.filename,
+                        link.upstream_url,
+                        link.blob_kind,
+                        link.blob_id,
+                        link.requires_python,
+                        link.yanked,
+                        link.gpg_sig.map(|value| if value { 1 } else { 0 }),
+                        link.dist_info_metadata,
+                        link.core_metadata,
+                        link.hash_name,
+                        link.hash_value,
+                    ])
+                    .map_err(sqlite_error)?;
+            }
         }
-    }
-    tx.commit().map_err(sqlite_error)?;
-    Ok(ProjectCache {
-        project: record.project.clone(),
-        fetched_at: record.fetched_at,
-        expires_at: record.expires_at,
-        upstream_etag: record.upstream_etag.clone(),
-        upstream_serial: record.upstream_serial,
-        upstream_project_url: record.upstream_project_url.clone(),
-        raw_body: record.raw_body.clone(),
-        links: record.links.clone(),
+        tx.commit().map_err(sqlite_error)?;
+        Ok(ProjectCache {
+            project: record.project.clone(),
+            fetched_at: record.fetched_at,
+            expires_at: record.expires_at,
+            upstream_etag: record.upstream_etag.clone(),
+            upstream_serial: record.upstream_serial,
+            upstream_project_url: record.upstream_project_url.clone(),
+            raw_body: record.raw_body.clone(),
+            links: record.links.clone(),
+        })
     })
 }
 
 fn blob_status_db(path: &Path, blob_kind: &str, blob_id: &str) -> io::Result<BlobStatus> {
-    let conn = open_db(path)?;
-    let row = conn
-        .query_row(
-            "SELECT storage_relpath, content_type, fetched_at, size_bytes, filename, upstream_url, state
+    with_db(path, |conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT storage_relpath, content_type, fetched_at, size_bytes, filename, upstream_url, state
              FROM blobs
              WHERE blob_kind = ?1 AND blob_id = ?2",
-            params![blob_kind, blob_id],
-            |row| {
+            )
+            .map_err(sqlite_error)?;
+        let row = stmt
+            .query_row(params![blob_kind, blob_id], |row| {
                 Ok(BlobInfo {
                     blob_kind: blob_kind.to_string(),
                     blob_id: blob_id.to_string(),
@@ -884,27 +957,32 @@ fn blob_status_db(path: &Path, blob_kind: &str, blob_id: &str) -> io::Result<Blo
                     upstream_url: row.get(5)?,
                     state: row.get(6)?,
                 })
-            },
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let Some(blob) = row else {
-        return Ok(BlobStatus::Missing);
-    };
-    if blob.state == BLOB_STATE_READY {
-        Ok(BlobStatus::Ready(blob))
-    } else if blob.state == BLOB_STATE_PENDING {
-        Ok(BlobStatus::Pending)
-    } else {
-        Ok(BlobStatus::Missing)
-    }
+            })
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some(blob) = row else {
+            return Ok(BlobStatus::Missing);
+        };
+        if blob.state == BLOB_STATE_READY {
+            Ok(BlobStatus::Ready(blob))
+        } else if blob.state == BLOB_STATE_PENDING {
+            Ok(BlobStatus::Pending)
+        } else {
+            Ok(BlobStatus::Missing)
+        }
+    })
 }
 
-fn query_link_by_blob<P>(conn: &Connection, sql: &str, params: P) -> io::Result<Option<CachedLink>>
+fn query_link_by_blob<P>(
+    conn: &mut Connection,
+    sql: &str,
+    params: P,
+) -> io::Result<Option<CachedLink>>
 where
     P: rusqlite::Params,
 {
-    conn.query_row(sql, params, |row| {
+    let mut stmt = conn.prepare_cached(sql).map_err(sqlite_error)?;
+    stmt.query_row(params, |row| {
         Ok(CachedLink {
             filename: row.get(0)?,
             upstream_url: row.get(1)?,
@@ -1061,6 +1139,10 @@ mod tests {
         assert_eq!(summary.project_count, 1);
         assert_eq!(summary.ready_blob_count, 1);
         assert_eq!(summary.cached_size_bytes, 1234);
+
+        let snapshot = cache.root_dashboard_snapshot_since(0).await.unwrap();
+        assert_eq!(snapshot.projects, summaries);
+        assert_eq!(snapshot.cache_summary, summary);
     }
 
     #[tokio::test]
