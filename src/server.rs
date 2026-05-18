@@ -3,7 +3,6 @@ use crate::cache::{
     RootHistorySample, current_unix_secs, fallback_blob_identity, hash_blob_identity,
 };
 use crate::config::AppConfig;
-use crate::hot_cache::BoundedLruCache;
 use crate::range::parse_byte_range;
 use crate::simple::{
     RootStats, json_media_type, normalize_project_name, parse_project_json_links,
@@ -23,8 +22,10 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::serve::ListenerExt;
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
+use moka::sync::Cache as ConcurrentCache;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
@@ -35,7 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{debug, error, info, warn};
@@ -56,11 +57,11 @@ struct AppState {
     hot_blobs: HotBlobCache,
 }
 
-type ActiveBlobRegistry = Arc<Mutex<HashMap<String, Arc<ActiveBlob>>>>;
-type HotProjectCache = Arc<RwLock<BoundedLruCache<String, HotProject>>>;
-type HotLinkCache = Arc<RwLock<BoundedLruCache<String, CachedLink>>>;
-type HotBlobCache = Arc<RwLock<BoundedLruCache<String, BlobInfo>>>;
-type RequestLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type ActiveBlobRegistry = Arc<DashMap<String, Arc<ActiveBlob>>>;
+type HotProjectCache = ConcurrentCache<String, Arc<HotProject>>;
+type HotLinkCache = ConcurrentCache<String, CachedLink>;
+type HotBlobCache = ConcurrentCache<String, BlobInfo>;
+type RequestLockMap = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type Counter = Arc<AtomicU64>;
 
 const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
@@ -80,9 +81,9 @@ struct HotProject {
 
 #[derive(Clone)]
 struct RenderedProject {
-    html_body: String,
+    html_body: Bytes,
     html_etag: String,
-    json_body: String,
+    json_body: Bytes,
     json_etag: String,
 }
 
@@ -184,15 +185,13 @@ impl RequestLocks {
     }
 
     async fn guard(&self, map: &RequestLockMap, key: &str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut map = map.lock().await;
-            if map.len() >= REQUEST_LOCK_CLEANUP_THRESHOLD {
-                map.retain(|_, lock| Arc::strong_count(lock) > 1);
-            }
-            map.entry(key.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        if map.len() >= REQUEST_LOCK_CLEANUP_THRESHOLD {
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        let lock = map
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
         lock.lock_owned().await
     }
 }
@@ -228,15 +227,9 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         locks: RequestLocks::default(),
         metrics: CacheMetrics::default(),
         active_blobs: ActiveBlobRegistry::default(),
-        hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
-            HOT_PROJECT_CACHE_MAX_ENTRIES,
-        ))),
-        hot_links: Arc::new(RwLock::new(BoundedLruCache::new(
-            HOT_LINK_CACHE_MAX_ENTRIES,
-        ))),
-        hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
-            HOT_BLOB_CACHE_MAX_ENTRIES,
-        ))),
+        hot_projects: ConcurrentCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES as u64),
+        hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
+        hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
     };
     if config.stats_interval_secs > 0 {
         spawn_cache_stats_logger(state.metrics.clone(), config.stats_interval_secs);
@@ -504,7 +497,7 @@ async fn simple_project(
     debug!(project = %normalized, "serving project page");
     match ensure_project(&state, &normalized).await {
         Ok(ProjectState::Ready(hot_project, stale)) => {
-            project_response(&headers, normalized, *hot_project, stale)
+            project_response(&headers, normalized, hot_project, stale)
         }
         Ok(ProjectState::Missing) => {
             info!(project = %normalized, "project not found upstream");
@@ -535,7 +528,7 @@ async fn pytorch_wheels_project(
     .await
     {
         Ok(ProjectState::Ready(hot_project, stale)) => {
-            project_response(&headers, normalized, *hot_project, stale)
+            project_response(&headers, normalized, hot_project, stale)
         }
         Ok(ProjectState::Missing) => {
             info!(project = %normalized, "pytorch wheels project not found upstream");
@@ -577,7 +570,7 @@ async fn pytorch_wheels_channel_project(
     .await
     {
         Ok(ProjectState::Ready(hot_project, stale)) => {
-            project_response(&headers, normalized, *hot_project, stale)
+            project_response(&headers, normalized, hot_project, stale)
         }
         Ok(ProjectState::Missing) => {
             info!(channel, project = %normalized, "pytorch wheels project not found upstream");
@@ -593,21 +586,21 @@ async fn pytorch_wheels_channel_project(
 fn project_response(
     headers: &HeaderMap,
     project: String,
-    hot_project: HotProject,
+    hot_project: Arc<HotProject>,
     stale: bool,
 ) -> Response<Body> {
     let format_json = wants_json(header_value(headers, ACCEPT));
     let (content_type, body, etag) = if format_json {
         (
             json_media_type(),
-            hot_project.rendered.json_body,
-            hot_project.rendered.json_etag,
+            hot_project.rendered.json_body.clone(),
+            hot_project.rendered.json_etag.clone(),
         )
     } else {
         (
             "text/html; charset=utf-8",
-            hot_project.rendered.html_body,
-            hot_project.rendered.html_etag,
+            hot_project.rendered.html_body.clone(),
+            hot_project.rendered.html_etag.clone(),
         )
     };
     debug!(
@@ -678,7 +671,7 @@ async fn package_file_from_parts(
 }
 
 enum ProjectState {
-    Ready(Box<HotProject>, bool),
+    Ready(Arc<HotProject>, bool),
     Missing,
 }
 
@@ -701,16 +694,12 @@ async fn ensure_project_with(
     file_base_path: &str,
 ) -> Result<ProjectState, StatusCode> {
     let project = cache_project;
-    if let Some(hot_project) = state
-        .hot_projects
-        .write()
-        .await
-        .get_cloned(&project.to_string())
+    if let Some(hot_project) = state.hot_projects.get(project)
         && state.cache.project_is_fresh(&hot_project.cache)
     {
         debug!(project, "project cache hit in memory");
         state.metrics.incr_project_hit();
-        return Ok(ProjectState::Ready(Box::new(hot_project), false));
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     if let Some(cached) = state
@@ -724,7 +713,7 @@ async fn ensure_project_with(
         state.metrics.incr_project_hit();
         let hot_project = build_hot_project(display_project, file_base_path, cached);
         cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(Box::new(hot_project), false));
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     let _guard = state.locks.project_guard(project).await;
@@ -740,7 +729,7 @@ async fn ensure_project_with(
         state.metrics.incr_project_hit();
         let hot_project = build_hot_project(display_project, file_base_path, project_cache.clone());
         cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(Box::new(hot_project), false));
+        return Ok(ProjectState::Ready(hot_project, false));
     }
 
     let etag = cached
@@ -804,7 +793,7 @@ async fn ensure_project_with(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let hot_project = build_hot_project(display_project, file_base_path, cached);
             cache_hot_project(state, project, hot_project.clone()).await;
-            Ok(ProjectState::Ready(Box::new(hot_project), false))
+            Ok(ProjectState::Ready(hot_project, false))
         }
         Ok(ProjectFetch::NotModified) => {
             debug!(project, "upstream project page not modified");
@@ -823,7 +812,7 @@ async fn ensure_project_with(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 let hot_project = build_hot_project(display_project, file_base_path, cached_value);
                 cache_hot_project(state, project, hot_project.clone()).await;
-                Ok(ProjectState::Ready(Box::new(hot_project), false))
+                Ok(ProjectState::Ready(hot_project, false))
             } else {
                 Err(StatusCode::BAD_GATEWAY)
             }
@@ -841,7 +830,7 @@ async fn ensure_project_with(
                 warn!(project, "serving stale project page after refresh failure");
                 let hot_project = build_hot_project(display_project, file_base_path, cached);
                 cache_hot_project(state, project, hot_project.clone()).await;
-                Ok(ProjectState::Ready(Box::new(hot_project), true))
+                Ok(ProjectState::Ready(hot_project, true))
             } else {
                 Err(status)
             }
@@ -849,29 +838,27 @@ async fn ensure_project_with(
     }
 }
 
-fn build_hot_project(project: &str, file_base_path: &str, cache: ProjectCache) -> HotProject {
+fn build_hot_project(project: &str, file_base_path: &str, cache: ProjectCache) -> Arc<HotProject> {
     let html_body = render_project_html_with_file_base(project, &cache.links, file_base_path);
     let json_body = render_project_json_with_file_base(project, &cache.links, file_base_path);
-    HotProject {
+    Arc::new(HotProject {
         cache,
         rendered: RenderedProject {
             html_etag: response_etag(html_body.as_bytes()),
             json_etag: response_etag(json_body.as_bytes()),
-            html_body,
-            json_body,
+            html_body: Bytes::from(html_body),
+            json_body: Bytes::from(json_body),
         },
-    }
+    })
 }
 
-async fn cache_hot_project(state: &AppState, project: &str, hot_project: HotProject) {
-    {
-        let mut hot_links = state.hot_links.write().await;
-        for link in &hot_project.cache.links {
-            hot_links.insert(route_key_for_link(link), link.clone());
-        }
+async fn cache_hot_project(state: &AppState, project: &str, hot_project: Arc<HotProject>) {
+    for link in &hot_project.cache.links {
+        state
+            .hot_links
+            .insert(route_key_for_link(link), link.clone());
     }
-    let mut hot_projects = state.hot_projects.write().await;
-    hot_projects.insert(project.to_string(), hot_project);
+    state.hot_projects.insert(project.to_string(), hot_project);
 }
 
 enum BlobResponse {
@@ -912,7 +899,7 @@ async fn ensure_blob(
     filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let key = route_key(route_a, route_b, filename);
-    let link = if let Some(link) = state.hot_links.write().await.get_cloned(&key) {
+    let link = if let Some(link) = state.hot_links.get(&key) {
         link
     } else {
         let Some(link) = state
@@ -923,8 +910,7 @@ async fn ensure_blob(
         else {
             return Err(StatusCode::NOT_FOUND);
         };
-        let mut hot_links = state.hot_links.write().await;
-        hot_links.insert(key, link.clone());
+        state.hot_links.insert(key, link.clone());
         link
     };
 
@@ -939,7 +925,7 @@ async fn ensure_metadata_blob(
     metadata_filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let base_key = route_key(route_a, route_b, base_filename);
-    let link = if let Some(link) = state.hot_links.write().await.get_cloned(&base_key) {
+    let link = if let Some(link) = state.hot_links.get(&base_key) {
         link
     } else {
         let Some(link) = state
@@ -950,8 +936,7 @@ async fn ensure_metadata_blob(
         else {
             return Err(StatusCode::NOT_FOUND);
         };
-        let mut hot_links = state.hot_links.write().await;
-        hot_links.insert(base_key, link.clone());
+        state.hot_links.insert(base_key, link.clone());
         link
     };
     let metadata_value = link
@@ -986,8 +971,7 @@ async fn ensure_metadata_blob(
         hash_value,
     };
     {
-        let mut hot_links = state.hot_links.write().await;
-        hot_links.insert(
+        state.hot_links.insert(
             route_key(route_a, route_b, metadata_filename),
             metadata_link.clone(),
         );
@@ -1013,7 +997,7 @@ async fn ensure_link_blob(
     filename: &str,
 ) -> Result<BlobResponse, StatusCode> {
     let key = blob_key(&link.blob_kind, &link.blob_id);
-    if let Some(blob) = state.hot_blobs.write().await.get_cloned(&key) {
+    if let Some(blob) = state.hot_blobs.get(&key) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit in memory");
         state.metrics.incr_blob_hit();
         return Ok(BlobResponse::Ready(blob));
@@ -1027,8 +1011,7 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
         state.metrics.incr_blob_hit();
-        let mut hot_blobs = state.hot_blobs.write().await;
-        hot_blobs.insert(key, blob.clone());
+        state.hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -1036,7 +1019,7 @@ async fn ensure_link_blob(
         .cache
         .blob_storage_relpath(&link.blob_kind, &link.blob_id, filename)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
+    if let Some(active) = state.active_blobs.get(&key).map(|entry| entry.clone()) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download");
         state.metrics.incr_blob_coalesced();
         return active_blob_response(active).await;
@@ -1051,11 +1034,10 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
         state.metrics.incr_blob_hit();
-        let mut hot_blobs = state.hot_blobs.write().await;
-        hot_blobs.insert(key, blob.clone());
+        state.hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
-    if let Some(active) = state.active_blobs.lock().await.get(&key).cloned() {
+    if let Some(active) = state.active_blobs.get(&key).map(|entry| entry.clone()) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "joining active blob download after lock");
         state.metrics.incr_blob_coalesced();
         return active_blob_response(active).await;
@@ -1103,11 +1085,7 @@ async fn ensure_link_blob(
         chunk_tx: broadcast::channel(BLOB_BROADCAST_CHANNEL_CAPACITY).0,
         failure: std::sync::Mutex::new(None),
     });
-    state
-        .active_blobs
-        .lock()
-        .await
-        .insert(key.clone(), active.clone());
+    state.active_blobs.insert(key.clone(), active.clone());
     drop(guard);
 
     let leader_rx = active.chunk_tx.subscribe();
@@ -1524,7 +1502,7 @@ async fn download_blob_task(job: DownloadJob) {
         }
         job.active.finished.store(true, Ordering::SeqCst);
         job.active.notify.notify_waiters();
-        job.active_blobs.lock().await.remove(&job.active_key);
+        job.active_blobs.remove(&job.active_key);
     }
 }
 
@@ -1671,8 +1649,8 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
             upstream_url: job.link.upstream_url.clone(),
         })
         .await?;
-    let mut hot_blobs = job.hot_blobs.write().await;
-    hot_blobs.insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    job.hot_blobs
+        .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
     info!(
         filename = %job.link.filename,
         blob_kind = %job.link.blob_kind,
@@ -1680,7 +1658,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
         size_bytes = bytes_received,
         "blob download completed"
     );
-    job.active_blobs.lock().await.remove(&job.active_key);
+    job.active_blobs.remove(&job.active_key);
     job.active.finished.store(true, Ordering::SeqCst);
     job.active.notify.notify_waiters();
     Ok(())
@@ -1751,13 +1729,13 @@ fn render_simple_response(
     stale: bool,
 ) -> Response<Body> {
     let etag = response_etag(body.as_bytes());
-    render_cached_simple_response(headers, content_type, body, etag, stale)
+    render_cached_simple_response(headers, content_type, Bytes::from(body), etag, stale)
 }
 
 fn render_cached_simple_response(
     headers: &HeaderMap,
     content_type: &str,
-    body: String,
+    body: Bytes,
     etag: String,
     stale: bool,
 ) -> Response<Body> {
@@ -1837,6 +1815,7 @@ fn join_error(err: tokio::task::JoinError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hot_cache::BoundedLruCache;
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::http::{Request, header::RANGE};
@@ -1880,7 +1859,7 @@ mod tests {
         }
     }
 
-    fn test_hot_project(project: &str) -> HotProject {
+    fn test_hot_project(project: &str) -> Arc<HotProject> {
         let record = test_project_record(project);
         build_hot_project(
             project,
@@ -1935,15 +1914,9 @@ mod tests {
             locks: RequestLocks::default(),
             metrics: CacheMetrics::default(),
             active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: Arc::new(RwLock::new(BoundedLruCache::new(
-                HOT_PROJECT_CACHE_MAX_ENTRIES,
-            ))),
-            hot_links: Arc::new(RwLock::new(BoundedLruCache::new(
-                HOT_LINK_CACHE_MAX_ENTRIES,
-            ))),
-            hot_blobs: Arc::new(RwLock::new(BoundedLruCache::new(
-                HOT_BLOB_CACHE_MAX_ENTRIES,
-            ))),
+            hot_projects: ConcurrentCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES as u64),
+            hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
+            hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
         }
     }
 
@@ -1956,11 +1929,8 @@ mod tests {
         }
 
         let fresh_guard = locks.project_guard("fresh").await;
-        let map = locks.projects.lock().await;
-
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key("fresh"));
-        drop(map);
+        assert_eq!(locks.projects.len(), 1);
+        assert!(locks.projects.contains_key("fresh"));
         drop(fresh_guard);
     }
 
@@ -1974,12 +1944,9 @@ mod tests {
         }
 
         let fresh_guard = locks.project_guard("fresh").await;
-        let map = locks.projects.lock().await;
-
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("active"));
-        assert!(map.contains_key("fresh"));
-        drop(map);
+        assert_eq!(locks.projects.len(), 2);
+        assert!(locks.projects.contains_key("active"));
+        assert!(locks.projects.contains_key("fresh"));
         drop(fresh_guard);
         drop(active_guard);
     }
@@ -2041,15 +2008,13 @@ mod tests {
         );
 
         assert!(
-            hot_project
-                .rendered
-                .html_body
+            std::str::from_utf8(&hot_project.rendered.html_body)
+                .unwrap()
                 .contains("/pytorch-wheels/cu126/+f/000/0000000000000/demo-0.whl#sha256=")
         );
         assert!(
-            hot_project
-                .rendered
-                .json_body
+            std::str::from_utf8(&hot_project.rendered.json_body)
+                .unwrap()
                 .contains("\"url\":\"/pytorch-wheels/cu126/+f/000/0000000000000/demo-0.whl\"")
         );
     }
@@ -2202,15 +2167,9 @@ mod tests {
         let record = test_project_record("demo");
         state.cache.store_project(&record).await.unwrap();
         cache_hot_project(&state, "demo", test_hot_project("demo")).await;
-        assert!(
-            state
-                .hot_projects
-                .read()
-                .await
-                .contains_key(&"demo".to_string())
-        );
+        assert!(state.hot_projects.get("demo").is_some());
 
-        state.hot_projects.write().await.remove(&"demo".to_string());
+        state.hot_projects.invalidate("demo");
         let project_state = ensure_project(&state, "demo").await.unwrap();
 
         let ProjectState::Ready(hot_project, stale) = project_state else {
@@ -2218,13 +2177,7 @@ mod tests {
         };
         assert!(!stale);
         assert_eq!(hot_project.cache.project, "demo");
-        assert!(
-            state
-                .hot_projects
-                .read()
-                .await
-                .contains_key(&"demo".to_string())
-        );
+        assert!(state.hot_projects.get("demo").is_some());
     }
 
     #[tokio::test]

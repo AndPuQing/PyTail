@@ -6,7 +6,7 @@ default-run = "pytail"
 autobins = false
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
@@ -24,12 +24,20 @@ name = "fanout_bench"
 path = "src/bin/fanout_bench.rs"
 required-features = ["bench-tools"]
 
+[[bin]]
+name = "hot_path_bench"
+path = "src/bin/hot_path_bench.rs"
+required-features = ["bench-tools"]
+
 [dependencies]
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+dashmap = "6"
 futures-util = "0.3"
 mime_guess = "2"
+mimalloc = "0.1"
+moka = { version = "0.12", features = ["sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.24"
