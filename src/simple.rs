@@ -490,7 +490,10 @@ pub fn render_project_html_with_file_base(
         }
         html.push_str("</td>\n                <td>");
         match link.cached_size_bytes {
-            Some(size) => html.push_str(&format_size(size)),
+            Some(size) => {
+                html.push_str(&format_size(size));
+                html.push_str(" <span class=\"badge-success\">cached</span>");
+            }
             None => html.push_str("<span class=\"muted\">not cached</span>"),
         }
         html.push_str("</td>\n                <td>");
@@ -897,6 +900,7 @@ mod tests {
         assert!(html.contains("<table class=\"file-table\">"));
         assert!(html.contains("demo-1.0.whl</a>"));
         assert!(html.contains("1.5 KB"));
+        assert!(html.contains("<span class=\"badge-success\">cached</span>"));
         assert!(html.contains("<dt>sha256</dt>"));
     }
 

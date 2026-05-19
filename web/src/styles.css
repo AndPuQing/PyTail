@@ -204,6 +204,10 @@
     @apply ml-2 rounded bg-amber-600 px-1.5 py-0.5 text-xs font-medium text-white;
   }
 
+  .badge-success {
+    @apply ml-2 rounded bg-emerald-600 px-1.5 py-0.5 text-xs font-medium text-white;
+  }
+
   .muted {
     @apply text-slate-500;
   }
