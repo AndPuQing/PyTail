@@ -25,7 +25,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use mime_guess::from_path;
-use moka::sync::Cache as ConcurrentCache;
+use moka::sync::{Cache as ConcurrentCache, CacheBuilder};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
@@ -66,7 +66,8 @@ type RequestLockMap = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type Counter = Arc<AtomicU64>;
 
 const REQUEST_LOCK_CLEANUP_THRESHOLD: usize = 1024;
-const HOT_PROJECT_CACHE_MAX_ENTRIES: usize = 1024;
+const HOT_PROJECT_CACHE_MAX_WEIGHT_KIB: u64 = 64 * 1024;
+const HOT_PROJECT_CACHE_MAX_ENTRY_KIB: u32 = 1024;
 const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
 const ROOT_STATS_HISTORY_MAX_AGE_SECS: u64 = 24 * 60 * 60;
@@ -78,6 +79,25 @@ const PYTORCH_WHEELS_FILE_BASE_PATH: &str = "/pytorch-wheels/+f";
 struct HotProject {
     cache: ProjectCache,
     rendered: RenderedProject,
+}
+
+impl HotProject {
+    fn estimated_heap_bytes(&self) -> usize {
+        self.cache.raw_body.len()
+            + self
+                .cache
+                .links
+                .iter()
+                .map(estimated_cached_link_bytes)
+                .sum::<usize>()
+            + self.rendered.html_body.len()
+            + self.rendered.json_body.len()
+            + self.rendered.html_etag.len()
+            + self.rendered.json_etag.len()
+            + self.cache.project.len()
+            + self.cache.upstream_project_url.len()
+            + self.cache.upstream_etag.as_ref().map_or(0, String::len)
+    }
 }
 
 #[derive(Clone)]
@@ -229,12 +249,12 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         locks: RequestLocks::default(),
         metrics: CacheMetrics::default(),
         active_blobs: ActiveBlobRegistry::default(),
-        hot_projects: ConcurrentCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES as u64),
+        hot_projects: hot_project_cache(),
         hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
         hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
     };
     if config.stats_interval_secs > 0 {
-        spawn_cache_stats_logger(state.metrics.clone(), config.stats_interval_secs);
+        spawn_cache_stats_logger(state.clone(), config.stats_interval_secs);
         spawn_root_stats_sampler(
             state.cache.clone(),
             state.metrics.clone(),
@@ -252,10 +272,23 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
     .map_err(io::Error::other)
 }
 
-fn spawn_cache_stats_logger(metrics: CacheMetrics, interval_secs: u64) {
+fn hot_project_cache() -> HotProjectCache {
+    CacheBuilder::new(HOT_PROJECT_CACHE_MAX_WEIGHT_KIB)
+        .weigher(|_project: &String, hot_project: &Arc<HotProject>| {
+            kib_weight(hot_project.estimated_heap_bytes())
+        })
+        .build()
+}
+
+fn kib_weight(bytes: usize) -> u32 {
+    bytes.div_ceil(1024).clamp(1, u32::MAX as usize) as u32
+}
+
+fn spawn_cache_stats_logger(state: AppState, interval_secs: u64) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         interval.tick().await;
+        let metrics = state.metrics.clone();
         let mut previous = metrics.snapshot();
         loop {
             interval.tick().await;
@@ -264,6 +297,7 @@ fn spawn_cache_stats_logger(metrics: CacheMetrics, interval_secs: u64) {
             previous = current;
             log_cache_stats("window", window);
             log_cache_stats("total", current);
+            log_memory_stats(&state);
         }
     });
 }
@@ -285,6 +319,44 @@ fn log_cache_stats(scope: &str, snapshot: CacheMetricsSnapshot) {
         blob_coalesced = snapshot.blob_coalesced,
         "cache stats"
     );
+}
+
+fn log_memory_stats(state: &AppState) {
+    let memory = process_memory_snapshot();
+    info!(
+        rss_kib = memory.as_ref().and_then(|snapshot| snapshot.rss_kib),
+        hwm_kib = memory.as_ref().and_then(|snapshot| snapshot.hwm_kib),
+        active_blobs = state.active_blobs.len(),
+        hot_projects = state.hot_projects.entry_count(),
+        hot_project_weight_kib = state.hot_projects.weighted_size(),
+        hot_links = state.hot_links.entry_count(),
+        hot_blobs = state.hot_blobs.entry_count(),
+        "memory stats"
+    );
+}
+
+#[derive(Debug, Default)]
+struct ProcessMemorySnapshot {
+    rss_kib: Option<u64>,
+    hwm_kib: Option<u64>,
+}
+
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut snapshot = ProcessMemorySnapshot::default();
+    for line in status.lines() {
+        if let Some(value) = parse_proc_status_kib(line, "VmRSS:") {
+            snapshot.rss_kib = Some(value);
+        } else if let Some(value) = parse_proc_status_kib(line, "VmHWM:") {
+            snapshot.hwm_kib = Some(value);
+        }
+    }
+    Some(snapshot)
+}
+
+fn parse_proc_status_kib(line: &str, key: &str) -> Option<u64> {
+    let value = line.strip_prefix(key)?.trim();
+    value.split_whitespace().next()?.parse().ok()
 }
 
 fn spawn_root_stats_sampler(cache: CacheStore, metrics: CacheMetrics, interval_secs: u64) {
@@ -832,11 +904,34 @@ fn build_hot_project(project: &str, file_base_path: &str, cache: ProjectCache) -
     })
 }
 
+fn estimated_cached_link_bytes(link: &CachedLink) -> usize {
+    link.filename.len()
+        + link.upstream_url.len()
+        + link.blob_kind.len()
+        + link.blob_id.len()
+        + link.requires_python.as_ref().map_or(0, String::len)
+        + link.yanked.as_ref().map_or(0, String::len)
+        + link.dist_info_metadata.as_ref().map_or(0, String::len)
+        + link.core_metadata.as_ref().map_or(0, String::len)
+        + link.hash_name.as_ref().map_or(0, String::len)
+        + link.hash_value.as_ref().map_or(0, String::len)
+}
+
 async fn cache_hot_project(state: &AppState, project: &str, hot_project: Arc<HotProject>) {
+    let project_weight_kib = kib_weight(hot_project.estimated_heap_bytes());
     for link in &hot_project.cache.links {
         state
             .hot_links
             .insert(route_key_for_link(link), link.clone());
+    }
+    if project_weight_kib > HOT_PROJECT_CACHE_MAX_ENTRY_KIB {
+        debug!(
+            project,
+            project_weight_kib,
+            max_entry_kib = HOT_PROJECT_CACHE_MAX_ENTRY_KIB,
+            "skipping oversized project page hot cache"
+        );
+        return;
     }
     state.hot_projects.insert(project.to_string(), hot_project);
 }
@@ -1241,7 +1336,7 @@ fn active_failure_status(message: &str) -> StatusCode {
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 const CLIENT_CHUNK_BYTES: usize = 256 * 1024;
 const DISK_FLUSH_BYTES: usize = 4 * 1024 * 1024;
-const BLOB_BROADCAST_CHANNEL_CAPACITY: usize = 1024;
+const BLOB_BROADCAST_CHANNEL_CAPACITY: usize = 64;
 const BLOB_WRITE_CHANNEL_CAPACITY: usize = 8;
 
 async fn open_active_blob_file(active: &ActiveBlob) -> io::Result<File> {
@@ -1896,6 +1991,23 @@ mod tests {
         assert!(!is_sha256_hash_name(None));
     }
 
+    #[test]
+    fn parses_proc_status_memory_values_as_kib() {
+        assert_eq!(
+            parse_proc_status_kib("VmRSS:\t   12345 kB", "VmRSS:"),
+            Some(12345)
+        );
+        assert_eq!(parse_proc_status_kib("VmSize:\t42 kB", "VmRSS:"), None);
+    }
+
+    #[test]
+    fn kib_weight_rounds_up_and_never_returns_zero() {
+        assert_eq!(kib_weight(0), 1);
+        assert_eq!(kib_weight(1), 1);
+        assert_eq!(kib_weight(1024), 1);
+        assert_eq!(kib_weight(1025), 2);
+    }
+
     fn test_state(cache: CacheStore, upstream_base_url: &str) -> AppState {
         AppState {
             cache,
@@ -1911,7 +2023,7 @@ mod tests {
             locks: RequestLocks::default(),
             metrics: CacheMetrics::default(),
             active_blobs: ActiveBlobRegistry::default(),
-            hot_projects: ConcurrentCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES as u64),
+            hot_projects: hot_project_cache(),
             hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
             hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
         }
@@ -1950,15 +2062,16 @@ mod tests {
 
     #[test]
     fn bounded_hot_cache_uses_lru_eviction() {
-        let attempted_projects = HOT_PROJECT_CACHE_MAX_ENTRIES + 25;
-        let mut projects = BoundedLruCache::new(HOT_PROJECT_CACHE_MAX_ENTRIES);
+        const HOT_PROJECT_TEST_MAX_ENTRIES: usize = 1024;
+        let attempted_projects = HOT_PROJECT_TEST_MAX_ENTRIES + 25;
+        let mut projects = BoundedLruCache::new(HOT_PROJECT_TEST_MAX_ENTRIES);
         for index in 0..attempted_projects {
             projects.insert(
                 format!("project-{index}"),
                 test_hot_project(&format!("project-{index}")),
             );
         }
-        assert_eq!(projects.len(), HOT_PROJECT_CACHE_MAX_ENTRIES);
+        assert_eq!(projects.len(), HOT_PROJECT_TEST_MAX_ENTRIES);
         assert!(projects.len() < attempted_projects);
 
         let attempted_links = HOT_LINK_CACHE_MAX_ENTRIES + 25;
