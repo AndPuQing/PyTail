@@ -414,7 +414,8 @@ impl CacheStore {
         let blob = blob.clone();
         tokio::task::spawn_blocking(move || {
             with_db(&db_path, |conn| {
-                conn.execute(
+                let tx = conn.transaction().map_err(sqlite_error)?;
+                tx.execute(
                     "UPDATE blobs
                  SET storage_relpath = ?3,
                      content_type = ?4,
@@ -437,6 +438,29 @@ impl CacheStore {
                     ],
                 )
                 .map_err(sqlite_error)?;
+                let projects = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT DISTINCT project
+                             FROM project_links
+                             WHERE blob_kind = ?1 AND blob_id = ?2",
+                        )
+                        .map_err(sqlite_error)?;
+                    let rows = stmt
+                        .query_map(params![blob.blob_kind, blob.blob_id], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(sqlite_error)?;
+                    let mut projects = Vec::new();
+                    for row in rows {
+                        projects.push(row.map_err(sqlite_error)?);
+                    }
+                    projects
+                };
+                for project in projects {
+                    update_project_stats_tx(&tx, &project)?;
+                }
+                tx.commit().map_err(sqlite_error)?;
                 Ok(BlobInfo {
                     blob_kind: blob.blob_kind,
                     blob_id: blob.blob_id,
@@ -541,42 +565,14 @@ fn list_projects_db(conn: &mut Connection) -> io::Result<Vec<String>> {
 fn list_project_summaries_db(conn: &mut Connection) -> io::Result<Vec<ProjectSummary>> {
     let mut stmt = conn
         .prepare_cached(
-            "WITH
-                project_file_counts AS (
-                    SELECT project, COUNT(position) AS file_count
-                    FROM project_links
-                    GROUP BY project
-                ),
-                ready_project_blobs AS (
-                    SELECT
-                        pl.project,
-                        b.blob_kind,
-                        b.blob_id,
-                        MAX(b.size_bytes) AS size_bytes
-                    FROM project_links pl
-                    JOIN blobs b
-                      ON b.blob_kind = pl.blob_kind
-                     AND b.blob_id = pl.blob_id
-                     AND b.state = 'ready'
-                    GROUP BY pl.project, b.blob_kind, b.blob_id
-                ),
-                ready_project_totals AS (
-                    SELECT
-                        project,
-                        COUNT(*) AS cached_file_count,
-                        COALESCE(SUM(size_bytes), 0) AS cached_size_bytes
-                    FROM ready_project_blobs
-                    GROUP BY project
-                )
-             SELECT
+            "SELECT
                  p.project,
                  p.upstream_project_url,
-                 COALESCE(pfc.file_count, 0) AS file_count,
-                 COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
-                 COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
+                 COALESCE(ps.file_count, 0) AS file_count,
+                 COALESCE(ps.cached_file_count, 0) AS cached_file_count,
+                 COALESCE(ps.cached_size_bytes, 0) AS cached_size_bytes
              FROM projects p
-             LEFT JOIN project_file_counts pfc ON pfc.project = p.project
-             LEFT JOIN ready_project_totals rpt ON rpt.project = p.project
+             LEFT JOIN project_stats ps ON ps.project = p.project
              ORDER BY p.project",
         )
         .map_err(sqlite_error)?;
@@ -736,6 +732,13 @@ fn init_db(path: &Path) -> io::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_blobs_state_size
             ON blobs (state, size_bytes);
 
+        CREATE TABLE IF NOT EXISTS project_stats (
+            project TEXT PRIMARY KEY,
+            file_count INTEGER NOT NULL,
+            cached_file_count INTEGER NOT NULL,
+            cached_size_bytes INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS root_stats_samples (
             sampled_at INTEGER PRIMARY KEY,
             cached_size_bytes INTEGER NOT NULL,
@@ -745,6 +748,7 @@ fn init_db(path: &Path) -> io::Result<()> {
         ",
     )
     .map_err(sqlite_error)?;
+    backfill_project_stats(&conn)?;
     Ok(())
 }
 
@@ -775,6 +779,91 @@ fn with_db<T>(path: &Path, op: impl FnOnce(&mut Connection) -> io::Result<T>) ->
             .expect("thread-local sqlite connection was just inserted");
         op(conn)
     })
+}
+
+fn backfill_project_stats(conn: &Connection) -> io::Result<()> {
+    conn.execute_batch(
+        "
+        INSERT INTO project_stats (
+            project, file_count, cached_file_count, cached_size_bytes
+        )
+        SELECT
+            p.project,
+            COALESCE(pfc.file_count, 0) AS file_count,
+            COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
+            COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
+        FROM projects p
+        LEFT JOIN (
+            SELECT project, COUNT(position) AS file_count
+            FROM project_links
+            GROUP BY project
+        ) pfc ON pfc.project = p.project
+        LEFT JOIN (
+            SELECT
+                project,
+                COUNT(*) AS cached_file_count,
+                COALESCE(SUM(size_bytes), 0) AS cached_size_bytes
+            FROM (
+                SELECT
+                    pl.project,
+                    b.blob_kind,
+                    b.blob_id,
+                    MAX(b.size_bytes) AS size_bytes
+                FROM project_links pl
+                JOIN blobs b
+                  ON b.blob_kind = pl.blob_kind
+                 AND b.blob_id = pl.blob_id
+                 AND b.state = 'ready'
+                GROUP BY pl.project, b.blob_kind, b.blob_id
+            )
+            GROUP BY project
+        ) rpt ON rpt.project = p.project
+        ON CONFLICT(project) DO NOTHING;
+        ",
+    )
+    .map_err(sqlite_error)
+}
+
+fn update_project_stats_tx(tx: &rusqlite::Transaction<'_>, project: &str) -> io::Result<()> {
+    tx.execute(
+        "INSERT INTO project_stats (
+            project, file_count, cached_file_count, cached_size_bytes
+         )
+         SELECT
+            ?1,
+            (SELECT COUNT(position) FROM project_links WHERE project = ?1),
+            COALESCE((
+                SELECT COUNT(*)
+                FROM (
+                    SELECT DISTINCT pl.blob_kind, pl.blob_id
+                    FROM project_links pl
+                    JOIN blobs b
+                      ON b.blob_kind = pl.blob_kind
+                     AND b.blob_id = pl.blob_id
+                     AND b.state = 'ready'
+                    WHERE pl.project = ?1
+                )
+            ), 0),
+            COALESCE((
+                SELECT SUM(size_bytes)
+                FROM (
+                    SELECT DISTINCT b.blob_kind, b.blob_id, b.size_bytes
+                    FROM project_links pl
+                    JOIN blobs b
+                      ON b.blob_kind = pl.blob_kind
+                     AND b.blob_id = pl.blob_id
+                     AND b.state = 'ready'
+                    WHERE pl.project = ?1
+                )
+            ), 0)
+         ON CONFLICT(project) DO UPDATE SET
+            file_count = excluded.file_count,
+            cached_file_count = excluded.cached_file_count,
+            cached_size_bytes = excluded.cached_size_bytes",
+        params![project],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache>> {
@@ -894,7 +983,7 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
         .map_err(sqlite_error)?;
         {
             let mut insert_link = tx
-            .prepare(
+                .prepare(
                 "INSERT INTO project_links (
                 project, position, filename, upstream_url, blob_kind, blob_id,
                 requires_python, yanked, gpg_sig, dist_info_metadata, core_metadata, hash_name, hash_value
@@ -921,6 +1010,7 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
                     .map_err(sqlite_error)?;
             }
         }
+        update_project_stats_tx(&tx, &record.project)?;
         tx.commit().map_err(sqlite_error)?;
         Ok(ProjectCache {
             project: record.project.clone(),

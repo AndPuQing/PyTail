@@ -70,6 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sql_speedup: {:.2}x",
         old.elapsed_ms.max(0.001) / new.elapsed_ms.max(0.001)
     );
+    println!(
+        "cache_api_vs_cte_speedup: {:.2}x",
+        new.elapsed_ms.max(0.001) / api.elapsed_ms.max(0.001)
+    );
+    println!(
+        "dashboard_api_vs_cte_speedup: {:.2}x",
+        new.elapsed_ms.max(0.001) / dashboard.elapsed_ms.max(0.001)
+    );
 
     Ok(())
 }
@@ -201,6 +209,43 @@ fn seed_db(
             }
         }
     }
+    tx.execute(
+        "INSERT INTO project_stats (
+            project, file_count, cached_file_count, cached_size_bytes
+         )
+         SELECT
+             p.project,
+             COALESCE(pfc.file_count, 0) AS file_count,
+             COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
+             COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
+         FROM projects p
+         LEFT JOIN (
+             SELECT project, COUNT(position) AS file_count
+             FROM project_links
+             GROUP BY project
+         ) pfc ON pfc.project = p.project
+         LEFT JOIN (
+             SELECT
+                 project,
+                 COUNT(*) AS cached_file_count,
+                 COALESCE(SUM(size_bytes), 0) AS cached_size_bytes
+             FROM (
+                 SELECT
+                     pl.project,
+                     b.blob_kind,
+                     b.blob_id,
+                     MAX(b.size_bytes) AS size_bytes
+                 FROM project_links pl
+                 JOIN blobs b
+                   ON b.blob_kind = pl.blob_kind
+                  AND b.blob_id = pl.blob_id
+                  AND b.state = 'ready'
+                 GROUP BY pl.project, b.blob_kind, b.blob_id
+             )
+             GROUP BY project
+         ) rpt ON rpt.project = p.project",
+        [],
+    )?;
     tx.commit()?;
     Ok(())
 }
