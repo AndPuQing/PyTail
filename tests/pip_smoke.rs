@@ -41,6 +41,7 @@ async fn pip_installs_package_through_local_simple_api() -> Result<(), Box<dyn E
             upstream_base_url: upstream.base_url.clone(),
             pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
             cache_dir,
+            cache_max_size: 0,
             project_cache_ttl_secs: 3600,
             request_timeout_secs: 5,
             stats_interval_secs: 0,

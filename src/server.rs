@@ -1,6 +1,7 @@
 use crate::cache::{
-    BlobInfo, BlobStatus, BlobWrite, CacheStore, CachedLink, ProjectCache, ProjectRecord,
-    RootHistorySample, current_unix_secs, fallback_blob_identity, hash_blob_identity,
+    BlobInfo, BlobStatus, BlobWrite, CacheStore, CachedLink, EvictedBlob, ProjectCache,
+    ProjectRecord, RootHistorySample, current_unix_secs, fallback_blob_identity,
+    hash_blob_identity,
 };
 use crate::config::AppConfig;
 use crate::range::parse_byte_range;
@@ -50,6 +51,7 @@ struct AppState {
     pytorch_channel_upstreams: Arc<DashMap<String, UpstreamClient>>,
     request_timeout_secs: u64,
     project_cache_ttl_secs: u64,
+    cache_max_size: u64,
     locks: RequestLocks,
     metrics: CacheMetrics,
     active_blobs: ActiveBlobRegistry,
@@ -229,6 +231,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         upstream = %config.upstream_base_url,
         pytorch_wheels_upstream = %config.pytorch_wheels_upstream_base_url,
         cache_dir = %config.cache_dir.display(),
+        cache_max_size = config.cache_max_size,
         project_cache_ttl_secs = config.project_cache_ttl_secs,
         request_timeout_secs = config.request_timeout_secs,
         stats_interval_secs = config.stats_interval_secs,
@@ -246,6 +249,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         pytorch_channel_upstreams: Arc::new(DashMap::new()),
         request_timeout_secs: config.request_timeout_secs,
         project_cache_ttl_secs: config.project_cache_ttl_secs,
+        cache_max_size: config.cache_max_size,
         locks: RequestLocks::default(),
         metrics: CacheMetrics::default(),
         active_blobs: ActiveBlobRegistry::default(),
@@ -1184,7 +1188,9 @@ async fn ensure_link_blob(
         cache: state.cache.clone(),
         upstream: state.upstream.clone(),
         active_blobs: state.active_blobs.clone(),
+        hot_projects: state.hot_projects.clone(),
         hot_blobs: state.hot_blobs.clone(),
+        cache_max_size: state.cache_max_size,
         active_key: key.clone(),
         active: active.clone(),
         link,
@@ -1351,7 +1357,9 @@ struct DownloadJob {
     cache: CacheStore,
     upstream: UpstreamClient,
     active_blobs: ActiveBlobRegistry,
+    hot_projects: HotProjectCache,
     hot_blobs: HotBlobCache,
+    cache_max_size: u64,
     active_key: String,
     active: Arc<ActiveBlob>,
     link: CachedLink,
@@ -1740,8 +1748,10 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
             upstream_url: job.link.upstream_url.clone(),
         })
         .await?;
-    job.hot_blobs
-        .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    if enforce_cache_size_after_download(job, &blob).await? {
+        job.hot_blobs
+            .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
+    }
     info!(
         filename = %job.link.filename,
         blob_kind = %job.link.blob_kind,
@@ -1753,6 +1763,47 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     job.active.finished.store(true, Ordering::SeqCst);
     job.active.notify.notify_waiters();
     Ok(())
+}
+
+async fn enforce_cache_size_after_download(
+    job: &DownloadJob,
+    downloaded: &BlobInfo,
+) -> io::Result<bool> {
+    if job.cache_max_size == 0 {
+        return Ok(true);
+    }
+
+    let evicted = job.cache.enforce_cache_size(job.cache_max_size).await?;
+    invalidate_evicted_blobs(&job.hot_blobs, &job.hot_projects, &evicted, downloaded);
+    let downloaded_evicted = evicted
+        .iter()
+        .any(|blob| blob.blob_kind == downloaded.blob_kind && blob.blob_id == downloaded.blob_id);
+    for blob in evicted {
+        info!(
+            filename = %blob.storage_relpath,
+            blob_kind = %blob.blob_kind,
+            blob_id = %blob.blob_id,
+            size_bytes = blob.size_bytes,
+            cache_max_size = job.cache_max_size,
+            "evicted cached blob after size limit enforcement"
+        );
+    }
+    Ok(!downloaded_evicted)
+}
+
+fn invalidate_evicted_blobs(
+    hot_blobs: &HotBlobCache,
+    hot_projects: &HotProjectCache,
+    evicted: &[EvictedBlob],
+    downloaded: &BlobInfo,
+) {
+    for blob in evicted {
+        hot_blobs.invalidate(&blob_key(&blob.blob_kind, &blob.blob_id));
+        for project in &blob.projects {
+            hot_projects.invalidate(project);
+        }
+    }
+    hot_blobs.invalidate(&blob_key(&downloaded.blob_kind, &downloaded.blob_id));
 }
 
 async fn write_blob_chunks_task(
@@ -2020,6 +2071,7 @@ mod tests {
             pytorch_channel_upstreams: Arc::new(DashMap::new()),
             request_timeout_secs: 5,
             project_cache_ttl_secs: 3600,
+            cache_max_size: 0,
             locks: RequestLocks::default(),
             metrics: CacheMetrics::default(),
             active_blobs: ActiveBlobRegistry::default(),

@@ -23,11 +23,29 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     requests: usize,
 
+    #[arg(long, default_value_t = 1)]
+    projects: usize,
+
     #[arg(long, default_value_t = 250)]
     links: usize,
 
+    #[arg(long, default_value_t = 5)]
+    min_links: usize,
+
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_host: String,
+
     #[arg(long, value_enum, default_value_t = Mode::Html)]
     mode: Mode,
+
+    #[arg(long, value_enum, default_value_t = Workload::Fixed)]
+    workload: Workload,
+
+    #[arg(long, value_enum, default_value_t = Distribution::RoundRobin)]
+    distribution: Distribution,
+
+    #[arg(long, default_value_t = 100)]
+    warm_project_percent: usize,
 
     #[arg(long, default_value_t = 15)]
     request_timeout_secs: u64,
@@ -38,19 +56,62 @@ enum Mode {
     Html,
     Json,
     NotModified,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Workload {
+    Fixed,
+    Realistic,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Distribution {
+    RoundRobin,
+    Hotspot,
 }
 
 #[derive(Clone)]
 struct UpstreamState {
-    project_body: Arc<String>,
+    link_profile: LinkProfile,
     project_requests: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinkProfile {
+    workload: Workload,
+    links: usize,
+    min_links: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSpec {
+    name: String,
+    link_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrimeResult {
+    json_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequestKind {
+    Html,
+    Json,
+    NotModified,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let upstream = spawn_upstream(args.links).await?;
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let link_profile = LinkProfile {
+        workload: args.workload,
+        links: args.links,
+        min_links: args.min_links,
+    };
+    let upstream = spawn_upstream(link_profile).await?;
+    let proxy_listener = TcpListener::bind((args.bind_host.as_str(), 0)).await?;
     let proxy_addr = proxy_listener.local_addr()?;
     let cache_dir = std::env::temp_dir().join(format!("pytail-hot-path-{}", unique_suffix()));
     tokio::fs::create_dir_all(&cache_dir).await?;
@@ -60,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             upstream_base_url: upstream.base_url.clone(),
             pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
             cache_dir,
+            cache_max_size: 0,
             project_cache_ttl_secs: 3600,
             request_timeout_secs: args.request_timeout_secs,
             stats_interval_secs: 0,
@@ -71,22 +133,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(args.clients.max(1))
         .timeout(Duration::from_secs(args.request_timeout_secs))
+        .no_proxy()
         .build()?;
-    let url = format!("http://{proxy_addr}/simple/demo/");
-    let (accept, etag) = prime_project(&client, &url, args.mode).await?;
+    let project_count = args.projects.max(1);
+    let projects = build_projects(project_count, link_profile);
+    let urls = projects
+        .iter()
+        .map(|project| format!("http://{proxy_addr}/simple/{}/", project.name))
+        .collect::<Vec<_>>();
+    let warm_project_count = warm_project_count(project_count, args.warm_project_percent);
+    let mut prime_results = vec![PrimeResult::default(); urls.len()];
+    for project_index in 0..warm_project_count {
+        prime_results[project_index] = prime_project(&client, &urls[project_index]).await?;
+    }
 
     let before_upstream_requests = upstream.state.project_requests.load(Ordering::SeqCst);
     let next_request = Arc::new(AtomicUsize::new(0));
+    let urls = Arc::new(urls);
+    let projects = Arc::new(projects);
+    let prime_results = Arc::new(prime_results);
     let started = Instant::now();
     let mut workers = Vec::with_capacity(args.clients);
 
     for _ in 0..args.clients {
         let client = client.clone();
-        let url = url.clone();
+        let urls = urls.clone();
+        let projects = projects.clone();
+        let prime_results = prime_results.clone();
         let next_request = next_request.clone();
-        let accept = accept.clone();
-        let etag = etag.clone();
         let total_requests = args.requests;
+        let distribution = args.distribution;
+        let mode = args.mode;
         workers.push(tokio::spawn(async move {
             let mut latencies = Vec::new();
             loop {
@@ -95,17 +172,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok::<Vec<u128>, String>(latencies);
                 }
 
-                let mut request = client.get(&url);
-                if let Some(accept) = &accept {
-                    request = request.header(ACCEPT, accept);
+                let project_index = select_project(request_id, projects.len(), distribution);
+                let request_kind =
+                    select_request_kind(request_id, mode, &prime_results[project_index]);
+                let mut request = client.get(&urls[project_index]);
+                match request_kind {
+                    RequestKind::Html => {}
+                    RequestKind::Json | RequestKind::NotModified => {
+                        request = request.header(ACCEPT, "application/vnd.pypi.simple.v1+json");
+                    }
                 }
-                if let Some(etag) = &etag {
+                if let RequestKind::NotModified = request_kind
+                    && let Some(etag) = &prime_results[project_index].json_etag
+                {
                     request = request.header(IF_NONE_MATCH, etag);
                 }
 
                 let started = Instant::now();
                 let response = request.send().await.map_err(|err| err.to_string())?;
-                let expected = if etag.is_some() {
+                let expected = if matches!(request_kind, RequestKind::NotModified)
+                    && prime_results[project_index].json_etag.is_some()
+                {
                     StatusCode::NOT_MODIFIED
                 } else {
                     StatusCode::OK
@@ -133,8 +220,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("scenario: hot-project-{:?}", args.mode);
     println!(
-        "config: clients={} requests={} links={}",
-        args.clients, args.requests, args.links
+        "config: clients={} requests={} projects={} warm_projects={} links={} min_links={} workload={:?} distribution={:?} bind_host={}",
+        args.clients,
+        args.requests,
+        project_count,
+        warm_project_count,
+        args.links,
+        args.min_links,
+        args.workload,
+        args.distribution,
+        args.bind_host
+    );
+    println!(
+        "project_links: min={} p50={} p95={} max={}",
+        project_link_percentile(&projects, 0.0),
+        project_link_percentile(&projects, 50.0),
+        project_link_percentile(&projects, 95.0),
+        project_link_percentile(&projects, 100.0)
     );
     println!("upstream_project_requests: {upstream_project_requests}");
     println!("wall_time_ms: {:.2}", elapsed.as_secs_f64() * 1000.0);
@@ -153,31 +255,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn prime_project(
     client: &reqwest::Client,
     url: &str,
-    mode: Mode,
-) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
-    let accept = match mode {
-        Mode::Html => None,
-        Mode::Json | Mode::NotModified => Some("application/vnd.pypi.simple.v1+json".to_string()),
-    };
-    let mut request = client.get(url);
-    if let Some(accept) = &accept {
-        request = request.header(ACCEPT, accept);
+) -> Result<PrimeResult, Box<dyn std::error::Error>> {
+    let html_response = client.get(url).send().await?;
+    if html_response.status() != StatusCode::OK {
+        return Err(format!("html prime request failed with {}", html_response.status()).into());
     }
-    let response = request.send().await?;
+    let _ = html_response.bytes().await?;
+
+    let response = client
+        .get(url)
+        .header(ACCEPT, "application/vnd.pypi.simple.v1+json")
+        .send()
+        .await?;
     if response.status() != StatusCode::OK {
-        return Err(format!("prime request failed with {}", response.status()).into());
+        return Err(format!("json prime request failed with {}", response.status()).into());
     }
-    let etag = response
+    let json_etag = response
         .headers()
         .get(ETAG)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
     let _ = response.bytes().await?;
-    let etag = match mode {
-        Mode::NotModified => etag,
-        Mode::Html | Mode::Json => None,
-    };
-    Ok((accept, etag))
+    Ok(PrimeResult { json_etag })
 }
 
 fn percentile(values: &[u128], percentile: f64) -> u128 {
@@ -193,9 +292,9 @@ struct Upstream {
     state: UpstreamState,
 }
 
-async fn spawn_upstream(links: usize) -> Result<Upstream, Box<dyn std::error::Error>> {
+async fn spawn_upstream(link_profile: LinkProfile) -> Result<Upstream, Box<dyn std::error::Error>> {
     let state = UpstreamState {
-        project_body: Arc::new(render_upstream_project(links)),
+        link_profile,
         project_requests: Arc::new(AtomicUsize::new(0)),
     };
     let app = Router::new()
@@ -217,12 +316,8 @@ async fn upstream_project(
     Path(project): Path<String>,
 ) -> Response<Body> {
     state.project_requests.fetch_add(1, Ordering::SeqCst);
-    if project != "demo" {
-        let mut response = Response::new(Body::from("not found"));
-        *response.status_mut() = StatusCode::NOT_FOUND;
-        return response;
-    }
-    let mut response = Response::new(Body::from(state.project_body.as_str().to_owned()));
+    let links = link_count_for_project(&project, state.link_profile);
+    let mut response = Response::new(Body::from(render_upstream_project(&project, links)));
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
@@ -230,20 +325,136 @@ async fn upstream_project(
     response
 }
 
-fn render_upstream_project(links: usize) -> String {
+fn render_upstream_project(project: &str, links: usize) -> String {
     let mut html = String::from("<!doctype html><html><body>\n");
     for index in 0..links {
         let hash = format!("{index:064x}");
-        html.push_str("<a href=\"../../packages/demo-");
+        html.push_str("<a href=\"../../packages/");
+        html.push_str(project);
+        html.push('-');
         html.push_str(&index.to_string());
         html.push_str(".whl#sha256=");
         html.push_str(&hash);
-        html.push_str("\" data-requires-python=\"&gt;=3.8\">demo-");
+        html.push_str("\" data-requires-python=\"&gt;=3.8\">");
+        html.push_str(project);
+        html.push('-');
         html.push_str(&index.to_string());
         html.push_str(".whl</a>\n");
     }
     html.push_str("</body></html>\n");
     html
+}
+
+fn project_name(project_id: usize) -> String {
+    if let Some(name) = COMMON_PROJECTS.get(project_id) {
+        return (*name).to_string();
+    }
+    let prefix = COMMON_PREFIXES[project_id % COMMON_PREFIXES.len()];
+    format!("{prefix}-{project_id}")
+}
+
+fn build_projects(project_count: usize, link_profile: LinkProfile) -> Vec<ProjectSpec> {
+    (0..project_count)
+        .map(|project_id| {
+            let name = if link_profile.workload == Workload::Fixed {
+                fixed_project_name(project_id)
+            } else {
+                project_name(project_id)
+            };
+            let link_count = link_count_for_project(&name, link_profile);
+            ProjectSpec { name, link_count }
+        })
+        .collect()
+}
+
+fn fixed_project_name(project_id: usize) -> String {
+    if project_id == 0 {
+        return "demo".to_string();
+    }
+    format!("demo-{project_id}")
+}
+
+fn link_count_for_project(project: &str, profile: LinkProfile) -> usize {
+    if profile.workload == Workload::Fixed {
+        return profile.links.max(1);
+    }
+    let min_links = profile.min_links.min(profile.links).max(1);
+    let max_links = profile.links.max(min_links);
+    let spread = max_links - min_links + 1;
+    min_links + (stable_hash(project) as usize % spread)
+}
+
+fn warm_project_count(project_count: usize, warm_project_percent: usize) -> usize {
+    let percent = warm_project_percent.min(100);
+    ((project_count * percent) + 99) / 100
+}
+
+fn select_project(request_id: usize, project_count: usize, distribution: Distribution) -> usize {
+    match distribution {
+        Distribution::RoundRobin => request_id % project_count,
+        Distribution::Hotspot => {
+            let hot_count = (project_count / 5).max(1);
+            let mixed = stable_mix(request_id as u64);
+            if request_id % 10 < 8 || hot_count == project_count {
+                (mixed as usize) % hot_count
+            } else {
+                hot_count + ((mixed as usize) % (project_count - hot_count))
+            }
+        }
+    }
+}
+
+fn select_request_kind(request_id: usize, mode: Mode, prime: &PrimeResult) -> RequestKind {
+    match mode {
+        Mode::Html => RequestKind::Html,
+        Mode::Json => RequestKind::Json,
+        Mode::NotModified => {
+            if prime.json_etag.is_some() {
+                RequestKind::NotModified
+            } else {
+                RequestKind::Json
+            }
+        }
+        Mode::Mixed => {
+            let bucket = stable_mix(request_id as u64) % 100;
+            if bucket < 65 {
+                RequestKind::Html
+            } else if bucket < 90 {
+                RequestKind::Json
+            } else if prime.json_etag.is_some() {
+                RequestKind::NotModified
+            } else {
+                RequestKind::Json
+            }
+        }
+    }
+}
+
+fn project_link_percentile(projects: &[ProjectSpec], percentile: f64) -> usize {
+    let mut counts = projects
+        .iter()
+        .map(|project| project.link_count)
+        .collect::<Vec<_>>();
+    counts.sort_unstable();
+    let rank = ((percentile / 100.0) * (counts.len().saturating_sub(1)) as f64).round() as usize;
+    counts[rank.min(counts.len() - 1)]
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn stable_mix(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
 }
 
 fn unique_suffix() -> String {
@@ -253,3 +464,86 @@ fn unique_suffix() -> String {
         .as_nanos();
     format!("{nanos}-{}", std::process::id())
 }
+
+const COMMON_PROJECTS: &[&str] = &[
+    "pip",
+    "setuptools",
+    "wheel",
+    "requests",
+    "urllib3",
+    "certifi",
+    "charset-normalizer",
+    "idna",
+    "packaging",
+    "typing-extensions",
+    "six",
+    "numpy",
+    "pandas",
+    "python-dateutil",
+    "pytz",
+    "pyyaml",
+    "click",
+    "jinja2",
+    "markupsafe",
+    "attrs",
+    "platformdirs",
+    "filelock",
+    "pydantic",
+    "pydantic-core",
+    "fastapi",
+    "starlette",
+    "uvicorn",
+    "anyio",
+    "httpx",
+    "httpcore",
+    "h11",
+    "sniffio",
+    "pytest",
+    "pluggy",
+    "iniconfig",
+    "tomli",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "rich",
+    "pygments",
+    "markdown-it-py",
+    "mdurl",
+    "sqlalchemy",
+    "greenlet",
+    "alembic",
+    "django",
+    "asgiref",
+    "flask",
+    "werkzeug",
+    "itsdangerous",
+    "scipy",
+    "matplotlib",
+    "pillow",
+    "contourpy",
+    "kiwisolver",
+    "fonttools",
+    "cycler",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "tokenizers",
+    "huggingface-hub",
+    "safetensors",
+];
+
+const COMMON_PREFIXES: &[&str] = &[
+    "pytest",
+    "django",
+    "fastapi",
+    "pydantic",
+    "types",
+    "opentelemetry",
+    "google",
+    "azure",
+    "apache",
+    "jupyter",
+    "sphinx",
+    "mkdocs",
+];

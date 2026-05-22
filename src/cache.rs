@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +87,15 @@ pub struct BlobInfo {
     pub filename: String,
     pub upstream_url: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedBlob {
+    pub blob_kind: String,
+    pub blob_id: String,
+    pub storage_relpath: String,
+    pub size_bytes: u64,
+    pub projects: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +487,32 @@ impl CacheStore {
         .map_err(join_error)?
     }
 
+    pub async fn enforce_cache_size(&self, max_size_bytes: u64) -> io::Result<Vec<EvictedBlob>> {
+        if max_size_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let db_path = self.db_path.clone();
+        let evicted = tokio::task::spawn_blocking(move || {
+            with_db(&db_path, |conn| {
+                prune_cache_to_size_db(conn, max_size_bytes)
+            })
+        })
+        .await
+        .map_err(join_error)??;
+
+        for blob in &evicted {
+            match fs::remove_file(self.blob_path(&blob.storage_relpath)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            prune_empty_parent_dirs(&self.root, &blob.storage_relpath).await?;
+        }
+
+        Ok(evicted)
+    }
+
     pub fn project_is_fresh(&self, project: &ProjectCache) -> bool {
         project.expires_at > current_unix_secs()
     }
@@ -732,6 +767,9 @@ fn init_db(path: &Path) -> io::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_blobs_state_size
             ON blobs (state, size_bytes);
 
+        CREATE INDEX IF NOT EXISTS idx_blobs_state_fetched_at
+            ON blobs (state, fetched_at);
+
         CREATE TABLE IF NOT EXISTS project_stats (
             project TEXT PRIMARY KEY,
             file_count INTEGER NOT NULL,
@@ -750,6 +788,89 @@ fn init_db(path: &Path) -> io::Result<()> {
     .map_err(sqlite_error)?;
     backfill_project_stats(&conn)?;
     Ok(())
+}
+
+fn prune_cache_to_size_db(
+    conn: &mut Connection,
+    max_size_bytes: u64,
+) -> io::Result<Vec<EvictedBlob>> {
+    let total_size = cache_summary_db(conn)?.cached_size_bytes;
+    if total_size <= max_size_bytes {
+        return Ok(Vec::new());
+    }
+
+    let candidates = {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT blob_kind, blob_id, storage_relpath, size_bytes
+                 FROM blobs
+                 WHERE state = 'ready'
+                 ORDER BY fetched_at ASC, blob_kind ASC, blob_id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(EvictedBlob {
+                    blob_kind: row.get(0)?,
+                    blob_id: row.get(1)?,
+                    storage_relpath: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    projects: Vec::new(),
+                })
+            })
+            .map_err(sqlite_error)?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row.map_err(sqlite_error)?);
+        }
+        candidates
+    };
+
+    let tx = conn.transaction().map_err(sqlite_error)?;
+    let mut remaining_size = total_size;
+    let mut evicted = Vec::new();
+    let mut changed_projects = HashSet::new();
+
+    for mut candidate in candidates {
+        if remaining_size <= max_size_bytes {
+            break;
+        }
+
+        candidate.projects = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT project
+                     FROM project_links
+                     WHERE blob_kind = ?1 AND blob_id = ?2",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map(params![candidate.blob_kind, candidate.blob_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(sqlite_error)?;
+            let mut projects = Vec::new();
+            for row in rows {
+                projects.push(row.map_err(sqlite_error)?);
+            }
+            projects
+        };
+
+        tx.execute(
+            "DELETE FROM blobs WHERE blob_kind = ?1 AND blob_id = ?2",
+            params![candidate.blob_kind, candidate.blob_id],
+        )
+        .map_err(sqlite_error)?;
+        remaining_size = remaining_size.saturating_sub(candidate.size_bytes);
+        changed_projects.extend(candidate.projects.iter().cloned());
+        evicted.push(candidate);
+    }
+
+    for project in changed_projects {
+        update_project_stats_tx(&tx, &project)?;
+    }
+    tx.commit().map_err(sqlite_error)?;
+    Ok(evicted)
 }
 
 fn open_db(path: &Path) -> io::Result<Connection> {
@@ -1146,6 +1267,25 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, bytes).await?;
     fs::rename(temp_path, path).await
+}
+
+async fn prune_empty_parent_dirs(root: &Path, relpath: &str) -> io::Result<()> {
+    let files_root = root.join("+files");
+    let mut current = root.join(relpath).parent().map(Path::to_path_buf);
+    while let Some(dir) = current {
+        if dir == files_root || !dir.starts_with(&files_root) {
+            break;
+        }
+        match fs::remove_dir(&dir).await {
+            Ok(()) => current = dir.parent().map(Path::to_path_buf),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                current = dir.parent().map(Path::to_path_buf);
+            }
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
