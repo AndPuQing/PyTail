@@ -386,7 +386,7 @@ fn link_count_for_project(project: &str, profile: LinkProfile) -> usize {
 
 fn warm_project_count(project_count: usize, warm_project_percent: usize) -> usize {
     let percent = warm_project_percent.min(100);
-    ((project_count * percent) + 99) / 100
+    (project_count * percent).div_ceil(100)
 }
 
 fn select_project(request_id: usize, project_count: usize, distribution: Distribution) -> usize {
