@@ -333,6 +333,34 @@ impl CacheStore {
         .map_err(join_error)?
     }
 
+    pub async fn touch_blob_access(
+        &self,
+        blob_kind: &str,
+        blob_id: &str,
+        accessed_at: u64,
+    ) -> io::Result<()> {
+        let db_path = self.db_path.clone();
+        let blob_kind = blob_kind.to_string();
+        let blob_id = blob_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            with_db(&db_path, |conn| {
+                conn.execute(
+                    "UPDATE blobs
+                     SET last_accessed_at = ?3
+                     WHERE blob_kind = ?1
+                       AND blob_id = ?2
+                       AND state = 'ready'
+                       AND last_accessed_at < ?3",
+                    params![blob_kind, blob_id, accessed_at],
+                )
+                .map_err(sqlite_error)?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn mark_blob_pending(
         &self,
         blob_kind: &str,
@@ -352,9 +380,9 @@ impl CacheStore {
                 let inserted = conn
                     .execute(
                         "INSERT OR IGNORE INTO blobs (
-                    blob_kind, blob_id, storage_relpath, content_type, fetched_at, size_bytes,
-                    filename, upstream_url, state
-                 ) VALUES (?1, ?2, ?3, '', 0, 0, ?4, ?5, ?6)",
+                    blob_kind, blob_id, storage_relpath, content_type, fetched_at,
+                    last_accessed_at, size_bytes, filename, upstream_url, state
+                 ) VALUES (?1, ?2, ?3, '', 0, 0, 0, ?4, ?5, ?6)",
                         params![
                             blob_kind,
                             blob_id,
@@ -429,6 +457,7 @@ impl CacheStore {
                  SET storage_relpath = ?3,
                      content_type = ?4,
                      fetched_at = ?5,
+                     last_accessed_at = ?5,
                      size_bytes = ?6,
                      filename = ?7,
                      upstream_url = ?8,
@@ -750,6 +779,7 @@ fn init_db(path: &Path) -> io::Result<()> {
             storage_relpath TEXT NOT NULL,
             content_type TEXT NOT NULL,
             fetched_at INTEGER NOT NULL,
+            last_accessed_at INTEGER NOT NULL,
             size_bytes INTEGER NOT NULL,
             filename TEXT NOT NULL,
             upstream_url TEXT NOT NULL,
@@ -786,8 +816,49 @@ fn init_db(path: &Path) -> io::Result<()> {
         ",
     )
     .map_err(sqlite_error)?;
+    migrate_blob_access_times(&conn)?;
     backfill_project_stats(&conn)?;
     Ok(())
+}
+
+fn migrate_blob_access_times(conn: &Connection) -> io::Result<()> {
+    if !table_has_column(conn, "blobs", "last_accessed_at")? {
+        conn.execute(
+            "ALTER TABLE blobs
+             ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    }
+    conn.execute(
+        "UPDATE blobs
+         SET last_accessed_at = fetched_at
+         WHERE state = 'ready' AND last_accessed_at = 0",
+        [],
+    )
+    .map_err(sqlite_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blobs_state_last_accessed_at
+         ON blobs (state, last_accessed_at)",
+        [],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> io::Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        if row.map_err(sqlite_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn prune_cache_to_size_db(
@@ -805,7 +876,7 @@ fn prune_cache_to_size_db(
                 "SELECT blob_kind, blob_id, storage_relpath, size_bytes
                  FROM blobs
                  WHERE state = 'ready'
-                 ORDER BY fetched_at ASC, blob_kind ASC, blob_id ASC",
+                 ORDER BY last_accessed_at ASC, fetched_at ASC, blob_kind ASC, blob_id ASC",
             )
             .map_err(sqlite_error)?;
         let rows = stmt
@@ -1482,5 +1553,181 @@ mod tests {
         assert_eq!(blob.storage_relpath, relpath);
         let bytes = cache.load_blob_bytes(&relpath).await.unwrap().unwrap();
         assert_eq!(bytes, b"wheel");
+    }
+
+    #[tokio::test]
+    async fn cache_size_enforcement_evicts_least_recently_used_blob() {
+        let temp = tempdir().unwrap();
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        let first_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let first_relpath = cache
+            .blob_storage_relpath("sha256", first_id, "first.whl")
+            .unwrap();
+        let second_relpath = cache
+            .blob_storage_relpath("sha256", second_id, "second.whl")
+            .unwrap();
+
+        cache
+            .store_project(&ProjectRecord {
+                project: "demo".to_string(),
+                fetched_at: 1,
+                expires_at: 10,
+                upstream_etag: None,
+                upstream_serial: None,
+                upstream_project_url: "https://example/simple/demo/".to_string(),
+                raw_body: "<html></html>".to_string(),
+                links: vec![
+                    CachedLink {
+                        filename: "first.whl".to_string(),
+                        upstream_url: "https://files.example/first.whl".to_string(),
+                        blob_kind: "sha256".to_string(),
+                        blob_id: first_id.to_string(),
+                        cached_size_bytes: None,
+                        requires_python: None,
+                        yanked: None,
+                        gpg_sig: None,
+                        dist_info_metadata: None,
+                        core_metadata: None,
+                        hash_name: Some("sha256".to_string()),
+                        hash_value: Some(first_id.to_string()),
+                    },
+                    CachedLink {
+                        filename: "second.whl".to_string(),
+                        upstream_url: "https://files.example/second.whl".to_string(),
+                        blob_kind: "sha256".to_string(),
+                        blob_id: second_id.to_string(),
+                        cached_size_bytes: None,
+                        requires_python: None,
+                        yanked: None,
+                        gpg_sig: None,
+                        dist_info_metadata: None,
+                        core_metadata: None,
+                        hash_name: Some("sha256".to_string()),
+                        hash_value: Some(second_id.to_string()),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        for (blob_id, relpath, filename, fetched_at) in [
+            (first_id, first_relpath.as_str(), "first.whl", 1),
+            (second_id, second_relpath.as_str(), "second.whl", 2),
+        ] {
+            cache
+                .mark_blob_pending(
+                    "sha256",
+                    blob_id,
+                    filename,
+                    &format!("https://files.example/{filename}"),
+                    relpath,
+                )
+                .await
+                .unwrap();
+            cache.store_blob_file(relpath, b"123456").await.unwrap();
+            cache
+                .mark_blob_ready(&BlobWrite {
+                    blob_kind: "sha256".to_string(),
+                    blob_id: blob_id.to_string(),
+                    storage_relpath: relpath.to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    fetched_at,
+                    size_bytes: 6,
+                    filename: filename.to_string(),
+                    upstream_url: format!("https://files.example/{filename}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        cache
+            .touch_blob_access("sha256", first_id, 10)
+            .await
+            .unwrap();
+        let evicted = cache.enforce_cache_size(6).await.unwrap();
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].blob_id, second_id);
+        assert!(
+            cache
+                .load_blob_bytes(&first_relpath)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .load_blob_bytes(&second_relpath)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            cache.blob_status("sha256", first_id).await.unwrap(),
+            BlobStatus::Ready(_)
+        ));
+        assert_eq!(
+            cache.blob_status("sha256", second_id).await.unwrap(),
+            BlobStatus::Missing
+        );
+
+        let summary = cache.cache_summary().await.unwrap();
+        assert_eq!(summary.ready_blob_count, 1);
+        assert_eq!(summary.cached_size_bytes, 6);
+        let project = cache.list_project_summaries().await.unwrap().remove(0);
+        assert_eq!(project.cached_file_count, 1);
+        assert_eq!(project.cached_size_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn initialize_migrates_blob_access_times_for_existing_cache() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE blobs (
+                    blob_kind TEXT NOT NULL,
+                    blob_id TEXT NOT NULL,
+                    storage_relpath TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    fetched_at INTEGER NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    upstream_url TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    PRIMARY KEY (blob_kind, blob_id),
+                    UNIQUE (storage_relpath)
+                );
+                INSERT INTO blobs (
+                    blob_kind, blob_id, storage_relpath, content_type, fetched_at,
+                    size_bytes, filename, upstream_url, state
+                ) VALUES (
+                    'sha256', 'old', '+files/root/pypi/+f/old/demo.whl',
+                    'application/octet-stream', 7, 5, 'demo.whl',
+                    'https://files.example/demo.whl', 'ready'
+                );
+                ",
+            )
+            .unwrap();
+        }
+
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        cache.touch_blob_access("sha256", "old", 9).await.unwrap();
+
+        let last_accessed_at = with_db(&cache.db_path, |conn| {
+            conn.query_row(
+                "SELECT last_accessed_at FROM blobs WHERE blob_kind = 'sha256' AND blob_id = 'old'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(sqlite_error)
+        })
+        .unwrap();
+        assert_eq!(last_accessed_at, 9);
     }
 }

@@ -116,6 +116,10 @@ pip install torch \
 - `--torch-url`: PyTorch wheels upstream root, default
   `https://download.pytorch.org/whl/`
 - `--cache-dir`: local cache directory, default `.cache/pytail`
+- `--cache-max-size`: maximum on-disk file cache size, default `0` for
+  unlimited; accepts byte values or units like `512MiB`, `2G`, and `10GB`.
+  When the limit is exceeded after a download, least-recently-used cached files
+  are evicted first.
 - `--project-cache-ttl-secs`: refresh age for cached project pages, default `900`
 - `--request-timeout-secs`: upstream HTTP timeout, default `15`
 - `--stats-interval-secs`: cache hit-rate and memory stats log interval, default

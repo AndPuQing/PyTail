@@ -1095,6 +1095,7 @@ async fn ensure_link_blob(
     if let Some(blob) = state.hot_blobs.get(&key) {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit in memory");
         state.metrics.incr_blob_hit();
+        touch_cached_blob(state, &blob).await?;
         return Ok(BlobResponse::Ready(blob));
     }
 
@@ -1106,6 +1107,7 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache hit on disk");
         state.metrics.incr_blob_hit();
+        touch_cached_blob(state, &blob).await?;
         state.hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
@@ -1129,6 +1131,7 @@ async fn ensure_link_blob(
     {
         debug!(filename, blob_kind = %link.blob_kind, blob_id = %link.blob_id, "blob cache filled while waiting for lock");
         state.metrics.incr_blob_hit();
+        touch_cached_blob(state, &blob).await?;
         state.hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
     }
@@ -1200,6 +1203,14 @@ async fn ensure_link_blob(
     }));
 
     active_blob_response_with_rx(active, leader_rx).await
+}
+
+async fn touch_cached_blob(state: &AppState, blob: &BlobInfo) -> Result<(), StatusCode> {
+    state
+        .cache
+        .touch_blob_access(&blob.blob_kind, &blob.blob_id, current_unix_secs())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn cached_file_response(
