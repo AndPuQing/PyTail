@@ -1815,6 +1815,8 @@ fn invalidate_evicted_blobs(
         }
     }
     hot_blobs.invalidate(&blob_key(&downloaded.blob_kind, &downloaded.blob_id));
+    hot_blobs.run_pending_tasks();
+    hot_projects.run_pending_tasks();
 }
 
 async fn write_blob_chunks_task(
