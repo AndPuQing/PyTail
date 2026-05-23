@@ -20,7 +20,31 @@ cache, or a local endpoint for PyPI and PyTorch wheel indexes.
 - PyTorch wheel index proxy under `/pytorch-wheels/`
 - HTML and JSON Simple API responses
 
+## Install
+
+Install from PyPI:
+
+```sh
+pip install pytail
+```
+
+Or install from source:
+
+```sh
+cargo install --path .
+```
+
 ## Run
+
+After installation:
+
+```sh
+pytail \
+  --bind 127.0.0.1:3141 \
+  --cache-dir .cache/pytail
+```
+
+From a source checkout:
 
 ```sh
 cargo run -- \
