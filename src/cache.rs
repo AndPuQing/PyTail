@@ -6,8 +6,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::sync::Mutex;
 
 const BLOB_STATE_PENDING: &str = "pending";
 const BLOB_STATE_READY: &str = "ready";
@@ -109,6 +111,7 @@ pub enum BlobStatus {
 pub struct CacheStore {
     root: PathBuf,
     db_path: PathBuf,
+    db_write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,11 +141,16 @@ pub struct BlobWrite {
 impl CacheStore {
     pub fn new(root: PathBuf) -> Self {
         let db_path = root.join("index.sqlite3");
-        Self { root, db_path }
+        Self {
+            root,
+            db_path,
+            db_write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn initialize(&self) -> io::Result<()> {
         fs::create_dir_all(self.files_root()).await?;
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || init_db(&db_path))
             .await
@@ -189,6 +197,7 @@ impl CacheStore {
     }
 
     pub async fn record_root_stats_sample(&self, sample: RootHistorySample) -> io::Result<()> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             with_db(&db_path, |conn| {
@@ -225,6 +234,7 @@ impl CacheStore {
     }
 
     pub async fn prune_root_stats_samples_before(&self, before: u64) -> io::Result<()> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             with_db(&db_path, |conn| {
@@ -249,6 +259,7 @@ impl CacheStore {
     }
 
     pub async fn store_project(&self, record: &ProjectRecord) -> io::Result<ProjectCache> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let record = record.clone();
         tokio::task::spawn_blocking(move || store_project_db(&db_path, &record))
@@ -262,6 +273,7 @@ impl CacheStore {
         fetched_at: u64,
         expires_at: u64,
     ) -> io::Result<()> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let project = normalize_project_name(project);
         tokio::task::spawn_blocking(move || {
@@ -339,6 +351,7 @@ impl CacheStore {
         blob_id: &str,
         accessed_at: u64,
     ) -> io::Result<()> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let blob_kind = blob_kind.to_string();
         let blob_id = blob_id.to_string();
@@ -369,6 +382,7 @@ impl CacheStore {
         upstream_url: &str,
         storage_relpath: &str,
     ) -> io::Result<bool> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let blob_kind = blob_kind.to_string();
         let blob_id = blob_id.to_string();
@@ -447,6 +461,7 @@ impl CacheStore {
     }
 
     pub async fn mark_blob_ready(&self, blob: &BlobWrite) -> io::Result<BlobInfo> {
+        let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let blob = blob.clone();
         tokio::task::spawn_blocking(move || {
@@ -521,14 +536,17 @@ impl CacheStore {
             return Ok(Vec::new());
         }
 
-        let db_path = self.db_path.clone();
-        let evicted = tokio::task::spawn_blocking(move || {
-            with_db(&db_path, |conn| {
-                prune_cache_to_size_db(conn, max_size_bytes)
+        let evicted = {
+            let _write_guard = self.db_write_lock.lock().await;
+            let db_path = self.db_path.clone();
+            tokio::task::spawn_blocking(move || {
+                with_db(&db_path, |conn| {
+                    prune_cache_to_size_db(conn, max_size_bytes)
+                })
             })
-        })
-        .await
-        .map_err(join_error)??;
+            .await
+            .map_err(join_error)??
+        };
 
         for blob in &evicted {
             match fs::remove_file(self.blob_path(&blob.storage_relpath)).await {
@@ -1444,6 +1462,70 @@ mod tests {
         let snapshot = cache.root_dashboard_snapshot_since(0).await.unwrap();
         assert_eq!(snapshot.projects, summaries);
         assert_eq!(snapshot.cache_summary, summary);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serializes_concurrent_database_writes() {
+        let temp = tempdir().unwrap();
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        let mut tasks = Vec::new();
+
+        for project_index in 0..8 {
+            let cache = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                let project = format!("project-{project_index}");
+                let links = (0..1_000)
+                    .map(|link_index| {
+                        let blob_id = format!("{project_index:02x}{link_index:062x}");
+                        CachedLink {
+                            filename: format!("{project}-{link_index}.whl"),
+                            upstream_url: format!(
+                                "https://files.example/{project}/{link_index}.whl"
+                            ),
+                            blob_kind: "sha256".to_string(),
+                            blob_id: blob_id.clone(),
+                            cached_size_bytes: None,
+                            requires_python: None,
+                            yanked: None,
+                            gpg_sig: None,
+                            dist_info_metadata: None,
+                            core_metadata: None,
+                            hash_name: Some("sha256".to_string()),
+                            hash_value: Some(blob_id),
+                        }
+                    })
+                    .collect();
+                cache
+                    .store_project(&ProjectRecord {
+                        project: project.clone(),
+                        fetched_at: 1,
+                        expires_at: 10,
+                        upstream_etag: None,
+                        upstream_serial: None,
+                        upstream_project_url: format!("https://example/simple/{project}/"),
+                        raw_body: "<html></html>".to_string(),
+                        links,
+                    })
+                    .await
+                    .map(|_| ())
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(cache.list_projects().await.unwrap().len(), 8);
+        assert_eq!(
+            cache
+                .load_project("project-0")
+                .await
+                .unwrap()
+                .unwrap()
+                .links
+                .len(),
+            1_000
+        );
     }
 
     #[tokio::test]

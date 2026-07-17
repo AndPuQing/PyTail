@@ -170,27 +170,48 @@ impl UpstreamClient {
                 response.status()
             )));
         }
-        let range = if response.status() == StatusCode::PARTIAL_CONTENT {
-            response
-                .headers()
-                .get(CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_content_range)
-        } else {
-            None
-        };
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
-        let content_length = response.content_length();
-        Ok(UpstreamFile {
-            response,
-            content_type,
-            content_length,
-            range,
-        })
+        Ok(upstream_file(response))
+    }
+
+    pub async fn fetch_file_range(&self, url: &str, range: &str) -> io::Result<UpstreamRangeFetch> {
+        let url = Url::parse(url).map_err(invalid_input)?;
+        debug!(%url, range, "opening upstream file range");
+        let response = self
+            .client
+            .get(url)
+            .header(RANGE, range)
+            .send()
+            .await
+            .map_err(io_other)?;
+        debug!(url = %response.url(), status = %response.status(), "upstream file range response");
+        match response.status() {
+            StatusCode::PARTIAL_CONTENT => {
+                let file = upstream_file(response);
+                if file.range.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "upstream range response did not include a valid Content-Range",
+                    ));
+                }
+                Ok(UpstreamRangeFetch::Partial(file))
+            }
+            StatusCode::OK => Ok(UpstreamRangeFetch::Unsupported),
+            StatusCode::RANGE_NOT_SATISFIABLE => {
+                let total = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_unsatisfied_content_range);
+                Ok(UpstreamRangeFetch::Unsatisfiable(total))
+            }
+            StatusCode::NOT_FOUND => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "upstream file not found",
+            )),
+            status => Err(io::Error::other(format!(
+                "upstream file range request failed with status {status}"
+            ))),
+        }
     }
 
     pub(crate) fn project_url(&self, project: &str) -> io::Result<Url> {
@@ -224,6 +245,12 @@ pub struct UpstreamFile {
     pub range: Option<ContentRange>,
 }
 
+pub enum UpstreamRangeFetch {
+    Partial(UpstreamFile),
+    Unsupported,
+    Unsatisfiable(Option<u64>),
+}
+
 impl UpstreamFile {
     pub fn into_stream(
         self,
@@ -252,6 +279,34 @@ fn parse_content_range(value: &str) -> Option<ContentRange> {
             Some(total.parse().ok()?)
         },
     })
+}
+
+fn parse_unsatisfied_content_range(value: &str) -> Option<u64> {
+    value.strip_prefix("bytes */")?.parse().ok()
+}
+
+fn upstream_file(response: ReqwestResponse) -> UpstreamFile {
+    let range = if response.status() == StatusCode::PARTIAL_CONTENT {
+        response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)
+    } else {
+        None
+    };
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let content_length = response.content_length();
+    UpstreamFile {
+        response,
+        content_type,
+        content_length,
+        range,
+    }
 }
 
 fn invalid_input(err: impl std::fmt::Display) -> io::Error {

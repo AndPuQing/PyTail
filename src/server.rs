@@ -10,7 +10,7 @@ use crate::simple::{
     parse_project_links, render_project_html_with_file_base, render_project_json_with_file_base,
     render_root_html, render_root_json, wants_json,
 };
-use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient};
+use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient, UpstreamRangeFetch};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -714,10 +714,11 @@ async fn package_file_from_parts(
         return text_response(StatusCode::NOT_FOUND, "file unavailable\n");
     }
     debug!(route_a, route_b, filename, "serving package file");
+    let range = header_value(&headers, RANGE);
     let response = if let Some(base_filename) = filename.strip_suffix(".metadata") {
-        ensure_metadata_blob(&state, &route_a, &route_b, base_filename, &filename).await
+        ensure_metadata_blob(&state, &route_a, &route_b, base_filename, &filename, range).await
     } else {
-        ensure_blob(&state, &route_a, &route_b, &filename).await
+        ensure_blob(&state, &route_a, &route_b, &filename, range).await
     };
     match response {
         Ok(BlobResponse::Ready(blob)) => cached_file_response(&state.cache, &blob, &headers).await,
@@ -792,93 +793,100 @@ async fn ensure_project_with(
         .as_ref()
         .and_then(|project_cache| project_cache.upstream_etag.as_deref());
     state.metrics.incr_project_miss();
-    let result = match upstream.fetch_project(display_project, etag).await {
-        Ok(ProjectFetch::Fresh(page)) => {
-            info!(project, "fetched fresh project page from upstream");
-            let page_url = Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
-            let parsed_links = match page.format {
-                ProjectPageFormat::Json => parse_project_json_links(&page.body, &page_url)
-                    .unwrap_or_else(|_| parse_project_links(&page.body, &page_url)),
-                ProjectPageFormat::Html => parse_project_links(&page.body, &page_url),
-            };
-            let links = parsed_links
-                .into_iter()
-                .map(|link| {
-                    let (blob_kind, blob_id) = match (&link.hash_name, &link.hash_value) {
-                        (Some(hash_name), Some(hash_value)) => {
-                            hash_blob_identity(hash_name, hash_value, &link.upstream_url)
+    let result = async {
+        match upstream.fetch_project(display_project, etag).await {
+            Ok(ProjectFetch::Fresh(page)) => {
+                info!(project, "fetched fresh project page from upstream");
+                let page_url =
+                    Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
+                let parsed_links = match page.format {
+                    ProjectPageFormat::Json => parse_project_json_links(&page.body, &page_url)
+                        .unwrap_or_else(|_| parse_project_links(&page.body, &page_url)),
+                    ProjectPageFormat::Html => parse_project_links(&page.body, &page_url),
+                };
+                let links = parsed_links
+                    .into_iter()
+                    .map(|link| {
+                        let (blob_kind, blob_id) = match (&link.hash_name, &link.hash_value) {
+                            (Some(hash_name), Some(hash_value)) => {
+                                hash_blob_identity(hash_name, hash_value, &link.upstream_url)
+                            }
+                            _ => fallback_blob_identity(&link.upstream_url),
+                        };
+                        CachedLink {
+                            filename: link.filename,
+                            upstream_url: link.upstream_url,
+                            blob_kind,
+                            blob_id,
+                            cached_size_bytes: None,
+                            requires_python: link.requires_python,
+                            yanked: link.yanked,
+                            gpg_sig: link.gpg_sig,
+                            dist_info_metadata: link.dist_info_metadata,
+                            core_metadata: link.core_metadata,
+                            hash_name: link.hash_name,
+                            hash_value: link.hash_value,
                         }
-                        _ => fallback_blob_identity(&link.upstream_url),
-                    };
-                    CachedLink {
-                        filename: link.filename,
-                        upstream_url: link.upstream_url,
-                        blob_kind,
-                        blob_id,
-                        cached_size_bytes: None,
-                        requires_python: link.requires_python,
-                        yanked: link.yanked,
-                        gpg_sig: link.gpg_sig,
-                        dist_info_metadata: link.dist_info_metadata,
-                        core_metadata: link.core_metadata,
-                        hash_name: link.hash_name,
-                        hash_value: link.hash_value,
-                    }
-                })
-                .collect::<Vec<_>>();
-            info!(
-                project,
-                links = links.len(),
-                "parsed upstream project links"
-            );
-            let now = current_unix_secs();
-            let record = ProjectRecord {
-                project: project.to_string(),
-                fetched_at: now,
-                expires_at: now + state.project_cache_ttl_secs,
-                upstream_etag: page.etag,
-                upstream_serial: page.serial,
-                upstream_project_url: page.project_url,
-                raw_body: page.body,
-                links,
-            };
-            let cached = state
-                .cache
-                .store_project(&record)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let hot_project = build_hot_project(display_project, file_base_path, cached);
-            cache_hot_project(state, project, hot_project.clone()).await;
-            Ok(ProjectState::Ready(hot_project, false))
-        }
-        Ok(ProjectFetch::NotModified) => {
-            debug!(project, "upstream project page not modified");
-            if let Some(mut cached_value) = cached.clone() {
+                    })
+                    .collect::<Vec<_>>();
+                info!(
+                    project,
+                    links = links.len(),
+                    "parsed upstream project links"
+                );
                 let now = current_unix_secs();
-                cached_value.fetched_at = now;
-                cached_value.expires_at = now + state.project_cache_ttl_secs;
-                state
-                    .cache
-                    .touch_project(
-                        &cached_value.project,
-                        cached_value.fetched_at,
-                        cached_value.expires_at,
-                    )
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                let hot_project = build_hot_project(display_project, file_base_path, cached_value);
+                let record = ProjectRecord {
+                    project: project.to_string(),
+                    fetched_at: now,
+                    expires_at: now + state.project_cache_ttl_secs,
+                    upstream_etag: page.etag,
+                    upstream_serial: page.serial,
+                    upstream_project_url: page.project_url,
+                    raw_body: page.body,
+                    links,
+                };
+                let cached = state.cache.store_project(&record).await.map_err(|err| {
+                    warn!(project, error = %err, "failed to store refreshed project page");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                let hot_project = build_hot_project(display_project, file_base_path, cached);
                 cache_hot_project(state, project, hot_project.clone()).await;
                 Ok(ProjectState::Ready(hot_project, false))
-            } else {
+            }
+            Ok(ProjectFetch::NotModified) => {
+                debug!(project, "upstream project page not modified");
+                if let Some(mut cached_value) = cached.clone() {
+                    let now = current_unix_secs();
+                    cached_value.fetched_at = now;
+                    cached_value.expires_at = now + state.project_cache_ttl_secs;
+                    state
+                        .cache
+                        .touch_project(
+                            &cached_value.project,
+                            cached_value.fetched_at,
+                            cached_value.expires_at,
+                        )
+                        .await
+                        .map_err(|err| {
+                            warn!(project, error = %err, "failed to persist project revalidation");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
+                    let hot_project =
+                        build_hot_project(display_project, file_base_path, cached_value);
+                    cache_hot_project(state, project, hot_project.clone()).await;
+                    Ok(ProjectState::Ready(hot_project, false))
+                } else {
+                    Err(StatusCode::BAD_GATEWAY)
+                }
+            }
+            Ok(ProjectFetch::NotFound) => Ok(ProjectState::Missing),
+            Err(err) => {
+                warn!(project, error = %err, "failed to fetch project page from upstream");
                 Err(StatusCode::BAD_GATEWAY)
             }
         }
-        Ok(ProjectFetch::NotFound) => Ok(ProjectState::Missing),
-        Err(err) => {
-            warn!(project, error = %err, "failed to fetch project page from upstream");
-            Err(StatusCode::BAD_GATEWAY)
-        }
-    };
+    }
+    .await;
     match result {
         Ok(value) => Ok(value),
         Err(status) => {
@@ -992,6 +1000,7 @@ async fn ensure_blob(
     route_a: &str,
     route_b: &str,
     filename: &str,
+    range: Option<&str>,
 ) -> Result<BlobResponse, StatusCode> {
     let key = route_key(route_a, route_b, filename);
     let link = if let Some(link) = state.hot_links.get(&key) {
@@ -1009,7 +1018,7 @@ async fn ensure_blob(
         link
     };
 
-    ensure_link_blob(state, link, filename).await
+    ensure_link_blob(state, link, filename, range).await
 }
 
 async fn ensure_metadata_blob(
@@ -1018,6 +1027,7 @@ async fn ensure_metadata_blob(
     route_b: &str,
     base_filename: &str,
     metadata_filename: &str,
+    range: Option<&str>,
 ) -> Result<BlobResponse, StatusCode> {
     let base_key = route_key(route_a, route_b, base_filename);
     let link = if let Some(link) = state.hot_links.get(&base_key) {
@@ -1071,7 +1081,7 @@ async fn ensure_metadata_blob(
             metadata_link.clone(),
         );
     }
-    ensure_link_blob(state, metadata_link, metadata_filename).await
+    ensure_link_blob(state, metadata_link, metadata_filename, range).await
 }
 
 fn metadata_hash(value: &str) -> Option<(String, String)> {
@@ -1090,6 +1100,7 @@ async fn ensure_link_blob(
     state: &AppState,
     link: CachedLink,
     filename: &str,
+    range: Option<&str>,
 ) -> Result<BlobResponse, StatusCode> {
     let key = blob_key(&link.blob_kind, &link.blob_id);
     if let Some(blob) = state.hot_blobs.get(&key) {
@@ -1110,6 +1121,12 @@ async fn ensure_link_blob(
         touch_cached_blob(state, &blob).await?;
         state.hot_blobs.insert(key, blob.clone());
         return Ok(BlobResponse::Ready(blob));
+    }
+
+    if let Some(range) = range
+        && let Some(response) = uncached_range_response(state, &link, filename, range).await?
+    {
+        return Ok(BlobResponse::Streaming(response));
     }
 
     let storage_relpath = state
@@ -1213,6 +1230,69 @@ async fn touch_cached_blob(state: &AppState, blob: &BlobInfo) -> Result<(), Stat
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn uncached_range_response(
+    state: &AppState,
+    link: &CachedLink,
+    filename: &str,
+    requested_range: &str,
+) -> Result<Option<Response<Body>>, StatusCode> {
+    match state
+        .upstream
+        .fetch_file_range(&link.upstream_url, requested_range)
+        .await
+    {
+        Ok(UpstreamRangeFetch::Partial(file)) => {
+            let range = file.range.ok_or(StatusCode::BAD_GATEWAY)?;
+            let content_length = file
+                .content_length
+                .unwrap_or_else(|| range.end - range.start + 1);
+            let content_type = file
+                .content_type
+                .clone()
+                .unwrap_or_else(|| from_path(filename).first_or_octet_stream().to_string());
+            let total = range
+                .total
+                .map_or_else(|| "*".to_string(), |total| total.to_string());
+            let stream = file.into_stream().map_err(io::Error::other);
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, header(&content_type));
+            response.headers_mut().insert(
+                CONTENT_RANGE,
+                header(&format!("bytes {}-{}/{total}", range.start, range.end)),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_LENGTH,
+                header(&content_length.to_string()),
+            );
+            response
+                .headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            Ok(Some(response))
+        }
+        Ok(UpstreamRangeFetch::Unsupported) => {
+            debug!(
+                filename,
+                requested_range, "upstream does not support byte ranges"
+            );
+            Ok(None)
+        }
+        Ok(UpstreamRangeFetch::Unsatisfiable(total)) => {
+            Ok(Some(upstream_range_not_satisfiable_response(total)))
+        }
+        Err(err) => {
+            warn!(filename, requested_range, error = %err, "upstream byte range request failed");
+            if err.kind() == io::ErrorKind::NotFound {
+                Err(StatusCode::NOT_FOUND)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 async fn cached_file_response(
     cache: &CacheStore,
     blob: &BlobInfo,
@@ -1292,6 +1372,19 @@ fn range_not_satisfiable_response(size: u64) -> Response<Body> {
     response
 }
 
+fn upstream_range_not_satisfiable_response(total: Option<u64>) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    let total = total.map_or_else(|| "*".to_string(), |total| total.to_string());
+    response
+        .headers_mut()
+        .insert(CONTENT_RANGE, header(&format!("bytes */{total}")));
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+}
+
 async fn active_blob_response(active: Arc<ActiveBlob>) -> Result<BlobResponse, StatusCode> {
     let rx = active.chunk_tx.subscribe();
     active_blob_response_with_rx(active, rx).await
@@ -1308,6 +1401,9 @@ async fn active_blob_response_with_rx(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, header(&active.content_type));
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Some(content_length) = content_length
         && let Ok(value) = HeaderValue::from_str(&content_length.to_string())
     {
@@ -1976,6 +2072,7 @@ mod tests {
     use axum::http::{Request, header::RANGE};
     use axum::routing::get;
     use futures_util::stream;
+    use rusqlite::Connection;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
@@ -2493,6 +2590,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"wheel-bytes");
     }
@@ -2560,6 +2658,84 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"metadata-bytes");
         assert_eq!(upstream.metadata_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxies_byte_ranges_before_file_is_cached() {
+        let upstream = spawn_upstream().await;
+        let temp = tempdir().unwrap();
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let path = html
+            .split('"')
+            .find(|part| part.starts_with("/root/pypi/+f/"))
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(RANGE, "bytes=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            "bytes 6-10/11"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"bytes");
+        assert_eq!(upstream.file_requests(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"wheel-bytes");
+        assert_eq!(upstream.file_requests(), 2);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(RANGE, "bytes=0-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"wheel");
+        assert_eq!(upstream.file_requests(), 2);
     }
 
     #[tokio::test]
@@ -3159,6 +3335,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn serves_stale_project_when_refresh_cannot_be_persisted() {
+        let upstream = spawn_upstream().await;
+        let temp = tempdir().unwrap();
+        let mut state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
+        state.project_cache_ttl_secs = 0;
+        state.cache.initialize().await.unwrap();
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let conn = Connection::open(temp.path().join("index.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_project_refresh
+             BEFORE UPDATE ON projects
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced project refresh failure');
+             END;",
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(WARNING).unwrap(),
+            "110 - response is stale"
+        );
+    }
+
     async fn spawn_upstream() -> TestUpstream {
         spawn_upstream_with_slow_file(false).await
     }
@@ -3275,14 +3501,13 @@ mod tests {
         state.file_requests.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(25)).await;
         let data = state.data.clone();
-        if let Some(start) = headers
-            .get(RANGE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("bytes="))
-            .and_then(|value| value.strip_suffix('-'))
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            let mut response = Response::new(Body::from(data.slice(start..)));
+        if let Some(value) = headers.get(RANGE).and_then(|value| value.to_str().ok()) {
+            let Ok(Some(range)) = parse_byte_range(value, data.len() as u64) else {
+                return range_not_satisfiable_response(data.len() as u64);
+            };
+            let start = range.start as usize;
+            let end = range.end as usize;
+            let mut response = Response::new(Body::from(data.slice(start..=end)));
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
             response.headers_mut().insert(
                 CONTENT_TYPE,
@@ -3290,13 +3515,15 @@ mod tests {
             );
             response.headers_mut().insert(
                 axum::http::header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {start}-{}/{}", data.len() - 1, data.len()))
-                    .unwrap(),
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{}", data.len())).unwrap(),
             );
             response.headers_mut().insert(
                 axum::http::header::CONTENT_LENGTH,
-                header(&(data.len() - start).to_string()),
+                header(&(end - start + 1).to_string()),
             );
+            response
+                .headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             return response;
         }
         let mut response = Response::new(Body::from_stream(stream::unfold(0, {
