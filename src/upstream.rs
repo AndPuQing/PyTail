@@ -19,6 +19,7 @@ const PYPI_LAST_SERIAL: &str = "x-pypi-last-serial";
 pub struct UpstreamClient {
     base_url: Url,
     base_is_simple_root: bool,
+    forbidden_is_not_found: bool,
     client: reqwest::Client,
 }
 
@@ -69,6 +70,7 @@ impl UpstreamClient {
         Ok(Self {
             base_url,
             base_is_simple_root,
+            forbidden_is_not_found: false,
             client,
         })
     }
@@ -76,6 +78,7 @@ impl UpstreamClient {
     pub fn new_project_root(base_url: &str, timeout_secs: u64) -> io::Result<Self> {
         let mut client = Self::new(base_url, timeout_secs)?;
         client.base_is_simple_root = true;
+        client.forbidden_is_not_found = true;
         Ok(client)
     }
 
@@ -130,6 +133,7 @@ impl UpstreamClient {
             }
             StatusCode::NOT_MODIFIED => Ok(ProjectFetch::NotModified),
             StatusCode::NOT_FOUND => Ok(ProjectFetch::NotFound),
+            StatusCode::FORBIDDEN if self.forbidden_is_not_found => Ok(ProjectFetch::NotFound),
             status => Err(io::Error::other(format!(
                 "upstream project request failed with status {status}"
             ))),
@@ -320,6 +324,9 @@ fn io_other(err: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
 
     #[test]
     fn project_url_accepts_origin_base_url() {
@@ -347,5 +354,38 @@ mod tests {
             client.project_url("Torch").unwrap().as_str(),
             "https://download.pytorch.org/whl/cu126/torch/"
         );
+    }
+
+    #[tokio::test]
+    async fn project_root_treats_forbidden_as_not_found() {
+        let base_url = spawn_forbidden_upstream().await;
+        let client = UpstreamClient::new_project_root(&base_url, 5).unwrap();
+
+        assert_eq!(
+            client.fetch_project("missing", None).await.unwrap(),
+            ProjectFetch::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_upstream_preserves_forbidden_response() {
+        let base_url = spawn_forbidden_upstream().await;
+        let client = UpstreamClient::new(&base_url, 5).unwrap();
+
+        let error = client.fetch_project("missing", None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "upstream project request failed with status 403 Forbidden"
+        );
+    }
+
+    async fn spawn_forbidden_upstream() -> String {
+        let app = Router::new().fallback(get(|| async { StatusCode::FORBIDDEN }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
     }
 }
