@@ -1911,6 +1911,9 @@ fn tail_file_stream(
                 if offset < available {
                     let mut buffer = vec![0_u8; (available - offset).min(1024 * 1024) as usize];
                     let opened = file.as_mut().expect("tail file is open");
+                    if let Err(err) = opened.seek(SeekFrom::Start(offset)).await {
+                        return Some((Err(err), (active, rx, file, offset)));
+                    }
                     match opened.read(&mut buffer).await {
                         Ok(0) if !active.finished.load(Ordering::SeqCst) => {
                             wait_for_active_progress(&active, offset).await;
@@ -2753,6 +2756,45 @@ mod tests {
         *active.failure.lock().unwrap() = Some(message.to_string());
         active.finished.store(true, Ordering::SeqCst);
         active.notify.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn active_blob_stream_resyncs_file_cursor_after_broadcast_progress() {
+        let temp = tempdir().unwrap();
+        let active = test_active_blob(&temp);
+        let data = Bytes::from_static(b"0123456789abcdef");
+        tokio::fs::write(&active.temp_path, &data).await.unwrap();
+        active
+            .content_length
+            .store(data.len() as u64, Ordering::SeqCst);
+        active.bytes_written.store(4, Ordering::SeqCst);
+
+        let rx = active.chunk_tx.subscribe();
+        let mut stream = Box::pin(tail_file_stream(active.clone(), rx));
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, data.slice(..4));
+
+        assert!(
+            active
+                .chunk_tx
+                .send(BlobChunk {
+                    offset: 4,
+                    bytes: data.slice(4..8),
+                })
+                .is_ok()
+        );
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second, data.slice(4..8));
+
+        active
+            .bytes_written
+            .store(data.len() as u64, Ordering::SeqCst);
+        active.finished.store(true, Ordering::SeqCst);
+        let mut body = [first.as_ref(), second.as_ref()].concat();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, data);
     }
 
     #[tokio::test]
