@@ -1,7 +1,7 @@
 use crate::cache::{
-    BlobInfo, BlobStatus, BlobWrite, CacheStore, CachedLink, EvictedBlob, ProjectCache,
-    ProjectRecord, RootHistorySample, current_unix_secs, fallback_blob_identity,
-    hash_blob_identity,
+    BlobInfo, BlobStatus, BlobWrite, CacheStore, CachedLink, CachedProjectResponses, EvictedBlob,
+    ProjectCache, ProjectRecord, ProjectResponseFormat, ProjectResponseRecord, RootHistorySample,
+    current_unix_secs, fallback_blob_identity, hash_blob_identity,
 };
 use crate::config::AppConfig;
 use crate::range::parse_byte_range;
@@ -15,8 +15,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
-    ACCEPT, ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, RANGE,
-    WARNING,
+    ACCEPT, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    LOCATION, RANGE, VARY, WARNING,
 };
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
@@ -55,12 +55,14 @@ struct AppState {
     locks: RequestLocks,
     metrics: CacheMetrics,
     active_blobs: ActiveBlobRegistry,
+    active_project_refreshes: ActiveProjectRefreshRegistry,
     hot_projects: HotProjectCache,
     hot_links: HotLinkCache,
     hot_blobs: HotBlobCache,
 }
 
 type ActiveBlobRegistry = Arc<DashMap<String, Arc<ActiveBlob>>>;
+type ActiveProjectRefreshRegistry = Arc<DashMap<String, ()>>;
 type HotProjectCache = ConcurrentCache<String, Arc<HotProject>>;
 type HotLinkCache = ConcurrentCache<String, CachedLink>;
 type HotBlobCache = ConcurrentCache<String, BlobInfo>;
@@ -73,6 +75,7 @@ const HOT_PROJECT_CACHE_MAX_ENTRY_KIB: u32 = 1024;
 const HOT_LINK_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const HOT_BLOB_CACHE_MAX_ENTRIES: usize = 8 * 1024;
 const ROOT_STATS_HISTORY_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+const PROJECT_REFRESH_RETRY_DELAY_SECS: u64 = 30;
 const FILE_STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const PYPI_FILE_BASE_PATH: &str = "/root/pypi/+f";
 const PYTORCH_WHEELS_FILE_BASE_PATH: &str = "/pytorch-wheels/+f";
@@ -85,13 +88,11 @@ struct HotProject {
 
 impl HotProject {
     fn estimated_heap_bytes(&self) -> usize {
-        self.cache.raw_body.len()
-            + self
-                .cache
-                .links
-                .iter()
-                .map(estimated_cached_link_bytes)
-                .sum::<usize>()
+        self.cache
+            .links
+            .iter()
+            .map(estimated_cached_link_bytes)
+            .sum::<usize>()
             + self.rendered.html_body.len()
             + self.rendered.json_body.len()
             + self.rendered.html_etag.len()
@@ -121,6 +122,17 @@ struct ActiveBlob {
     notify: Notify,
     chunk_tx: broadcast::Sender<BlobChunk>,
     failure: std::sync::Mutex<Option<String>>,
+}
+
+struct ProjectRefreshRegistration {
+    registry: ActiveProjectRefreshRegistry,
+    project: String,
+}
+
+impl Drop for ProjectRefreshRegistration {
+    fn drop(&mut self) {
+        self.registry.remove(&self.project);
+    }
 }
 
 #[derive(Clone)]
@@ -253,6 +265,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         locks: RequestLocks::default(),
         metrics: CacheMetrics::default(),
         active_blobs: ActiveBlobRegistry::default(),
+        active_project_refreshes: ActiveProjectRefreshRegistry::default(),
         hot_projects: hot_project_cache(),
         hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
         hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
@@ -331,6 +344,7 @@ fn log_memory_stats(state: &AppState) {
         rss_kib = memory.as_ref().and_then(|snapshot| snapshot.rss_kib),
         hwm_kib = memory.as_ref().and_then(|snapshot| snapshot.hwm_kib),
         active_blobs = state.active_blobs.len(),
+        active_project_refreshes = state.active_project_refreshes.len(),
         hot_projects = state.hot_projects.entry_count(),
         hot_project_weight_kib = state.hot_projects.weighted_size(),
         hot_links = state.hot_links.entry_count(),
@@ -554,6 +568,20 @@ async fn simple_project(
 ) -> Response<Body> {
     let normalized = normalize_project_name(&project);
     debug!(project = %normalized, "serving project page");
+    match materialized_not_modified_response(
+        &state,
+        &state.upstream,
+        &normalized,
+        &normalized,
+        PYPI_FILE_BASE_PATH,
+        &headers,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(status) => return text_response(status, "cache unavailable\n"),
+    }
     match ensure_project(&state, &normalized).await {
         Ok(ProjectState::Ready(hot_project, stale)) => {
             project_response(&headers, normalized, hot_project, stale)
@@ -577,6 +605,20 @@ async fn pytorch_wheels_project(
     let normalized = normalize_project_name(&project);
     let cache_project = pytorch_wheels_cache_project(None, &normalized);
     debug!(project = %normalized, "serving pytorch wheels project page");
+    match materialized_not_modified_response(
+        &state,
+        &state.pytorch_wheels_upstream,
+        &cache_project,
+        &normalized,
+        PYTORCH_WHEELS_FILE_BASE_PATH,
+        &headers,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(status) => return text_response(status, "cache unavailable\n"),
+    }
     match ensure_project_with(
         &state,
         &state.pytorch_wheels_upstream,
@@ -616,6 +658,20 @@ async fn pytorch_wheels_channel_project(
         }
     };
     debug!(channel, project = %normalized, "serving pytorch wheels channel project page");
+    match materialized_not_modified_response(
+        &state,
+        &upstream,
+        &cache_project,
+        &normalized,
+        &file_base_path,
+        &headers,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(status) => return text_response(status, "cache unavailable\n"),
+    }
     match ensure_project_with(
         &state,
         &upstream,
@@ -665,7 +721,82 @@ fn project_response(
         format = if format_json { "json" } else { "html" },
         "project page ready"
     );
-    render_cached_simple_response(headers, content_type, body, etag, stale)
+    let mut response = render_cached_simple_response(headers, content_type, body, etag, stale);
+    apply_project_cache_control(&mut response, hot_project.cache.expires_at, stale);
+    response
+}
+
+async fn materialized_not_modified_response(
+    state: &AppState,
+    upstream: &UpstreamClient,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+    headers: &HeaderMap,
+) -> Result<Option<Response<Body>>, StatusCode> {
+    let Some(if_none_match) = header_value(headers, IF_NONE_MATCH) else {
+        return Ok(None);
+    };
+    if state.hot_projects.get(cache_project).is_some() {
+        return Ok(None);
+    }
+    let format = if wants_json(header_value(headers, ACCEPT)) {
+        ProjectResponseFormat::Json
+    } else {
+        ProjectResponseFormat::Html
+    };
+    let validator = state
+        .cache
+        .load_project_response_validator(cache_project, format)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(validator) = validator else {
+        return Ok(None);
+    };
+    if !if_none_match_matches(if_none_match, &validator.etag) {
+        return Ok(None);
+    }
+
+    state.metrics.incr_project_hit();
+    let stale = validator.expires_at <= current_unix_secs();
+    if stale {
+        spawn_project_refresh(
+            state,
+            upstream,
+            cache_project,
+            display_project,
+            file_base_path,
+        );
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    response.headers_mut().insert(ETAG, header(&validator.etag));
+    apply_simple_vary(&mut response);
+    if stale {
+        response
+            .headers_mut()
+            .insert(WARNING, HeaderValue::from_static("110 - response is stale"));
+    }
+    apply_project_cache_control(&mut response, validator.expires_at, stale);
+    debug!(
+        project = cache_project,
+        stale, "project response validator cache hit"
+    );
+    Ok(Some(response))
+}
+
+fn apply_project_cache_control(response: &mut Response<Body>, expires_at: u64, stale: bool) {
+    let max_age = if stale {
+        0
+    } else {
+        expires_at.saturating_sub(current_unix_secs())
+    };
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        header(&format!(
+            "public, max-age={max_age}, stale-while-revalidate=60, stale-if-error=86400"
+        )),
+    );
 }
 
 async fn package_file(
@@ -751,48 +882,241 @@ async fn ensure_project_with(
     file_base_path: &str,
 ) -> Result<ProjectState, StatusCode> {
     let project = cache_project;
-    if let Some(hot_project) = state.hot_projects.get(project)
-        && state.cache.project_is_fresh(&hot_project.cache)
-    {
-        debug!(project, "project cache hit in memory");
+    if let Some(hot_project) = state.hot_projects.get(project) {
         state.metrics.incr_project_hit();
-        return Ok(ProjectState::Ready(hot_project, false));
+        if state.cache.project_is_fresh(&hot_project.cache) {
+            debug!(project, "project cache hit in memory");
+            return Ok(ProjectState::Ready(hot_project, false));
+        }
+        debug!(
+            project,
+            "serving stale memory project cache while refreshing"
+        );
+        spawn_project_refresh(
+            state,
+            upstream,
+            cache_project,
+            display_project,
+            file_base_path,
+        );
+        return Ok(ProjectState::Ready(hot_project, true));
     }
 
-    if let Some(cached) = state
+    if let Some(responses) = state
         .cache
-        .load_project(project)
+        .load_project_responses(project)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        && state.cache.project_is_fresh(&cached)
     {
-        debug!(project, "project cache hit on disk");
         state.metrics.incr_project_hit();
-        let hot_project = build_hot_project(display_project, file_base_path, cached);
+        let hot_project = hot_project_from_responses(responses);
         cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(hot_project, false));
+        if state.cache.project_is_fresh(&hot_project.cache) {
+            debug!(project, "project response cache hit on disk");
+            return Ok(ProjectState::Ready(hot_project, false));
+        }
+        debug!(
+            project,
+            "serving stale materialized project response while refreshing"
+        );
+        spawn_project_refresh(
+            state,
+            upstream,
+            cache_project,
+            display_project,
+            file_base_path,
+        );
+        return Ok(ProjectState::Ready(hot_project, true));
     }
 
-    let _guard = state.locks.project_guard(project).await;
     let cached = state
         .cache
         .load_project(project)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if let Some(project_cache) = &cached
-        && state.cache.project_is_fresh(project_cache)
-    {
-        debug!(project, "project cache filled while waiting for lock");
+    if let Some(cached) = cached {
         state.metrics.incr_project_hit();
-        let hot_project = build_hot_project(display_project, file_base_path, project_cache.clone());
-        cache_hot_project(state, project, hot_project.clone()).await;
-        return Ok(ProjectState::Ready(hot_project, false));
+        let hot_project =
+            materialize_project(state, project, display_project, file_base_path, cached).await;
+        if state.cache.project_is_fresh(&hot_project.cache) {
+            debug!(project, "project cache hit on disk");
+            return Ok(ProjectState::Ready(hot_project, false));
+        }
+        debug!(project, "serving stale disk project cache while refreshing");
+        spawn_project_refresh(
+            state,
+            upstream,
+            cache_project,
+            display_project,
+            file_base_path,
+        );
+        return Ok(ProjectState::Ready(hot_project, true));
     }
 
+    let guard = state.locks.project_guard(project).await;
+    let cached = state
+        .cache
+        .load_project(project)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(project_cache) = cached {
+        state.metrics.incr_project_hit();
+        let hot_project = materialize_project(
+            state,
+            project,
+            display_project,
+            file_base_path,
+            project_cache,
+        )
+        .await;
+        if state.cache.project_is_fresh(&hot_project.cache) {
+            debug!(project, "project cache filled while waiting for lock");
+            return Ok(ProjectState::Ready(hot_project, false));
+        }
+        debug!(
+            project,
+            "serving stale project cache filled while waiting for lock"
+        );
+        drop(guard);
+        spawn_project_refresh(
+            state,
+            upstream,
+            cache_project,
+            display_project,
+            file_base_path,
+        );
+        return Ok(ProjectState::Ready(hot_project, true));
+    }
+
+    state.metrics.incr_project_miss();
+    refresh_project_cache(
+        state,
+        upstream,
+        cache_project,
+        display_project,
+        file_base_path,
+        None,
+    )
+    .await
+}
+
+fn spawn_project_refresh(
+    state: &AppState,
+    upstream: &UpstreamClient,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+) {
+    if state
+        .active_project_refreshes
+        .insert(cache_project.to_string(), ())
+        .is_some()
+    {
+        debug!(
+            project = cache_project,
+            "project refresh already in progress"
+        );
+        return;
+    }
+
+    let registration = ProjectRefreshRegistration {
+        registry: state.active_project_refreshes.clone(),
+        project: cache_project.to_string(),
+    };
+    let state = state.clone();
+    let upstream = upstream.clone();
+    let cache_project = cache_project.to_string();
+    let display_project = display_project.to_string();
+    let file_base_path = file_base_path.to_string();
+    tokio::spawn(async move {
+        let retry_later = refresh_stale_project(
+            &state,
+            &upstream,
+            &cache_project,
+            &display_project,
+            &file_base_path,
+        )
+        .await;
+        if retry_later {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                PROJECT_REFRESH_RETRY_DELAY_SECS,
+            ))
+            .await;
+        }
+        drop(registration);
+    });
+}
+
+async fn refresh_stale_project(
+    state: &AppState,
+    upstream: &UpstreamClient,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+) -> bool {
+    let _guard = state.locks.project_guard(cache_project).await;
+    let cached = match state.cache.load_project(cache_project).await {
+        Ok(cached) => cached,
+        Err(err) => {
+            warn!(project = cache_project, error = %err, "failed to load project for background refresh");
+            return true;
+        }
+    };
+    let Some(cached) = cached else {
+        return false;
+    };
+    if state.cache.project_is_fresh(&cached) {
+        return false;
+    }
+
+    debug!(
+        project = cache_project,
+        "starting background project refresh"
+    );
+    match refresh_project_cache(
+        state,
+        upstream,
+        cache_project,
+        display_project,
+        file_base_path,
+        Some(cached),
+    )
+    .await
+    {
+        Ok(ProjectState::Ready(_, false)) => {
+            debug!(
+                project = cache_project,
+                "background project refresh completed"
+            );
+            false
+        }
+        Ok(ProjectState::Ready(_, true)) => true,
+        Ok(ProjectState::Missing) => {
+            warn!(
+                project = cache_project,
+                "background project refresh returned not found"
+            );
+            true
+        }
+        Err(status) => {
+            warn!(project = cache_project, %status, "background project refresh failed");
+            true
+        }
+    }
+}
+
+async fn refresh_project_cache(
+    state: &AppState,
+    upstream: &UpstreamClient,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+    cached: Option<ProjectCache>,
+) -> Result<ProjectState, StatusCode> {
+    let project = cache_project;
     let etag = cached
         .as_ref()
         .and_then(|project_cache| project_cache.upstream_etag.as_deref());
-    state.metrics.incr_project_miss();
     let result = async {
         match upstream.fetch_project(display_project, etag).await {
             Ok(ProjectFetch::Fresh(page)) => {
@@ -842,15 +1166,15 @@ async fn ensure_project_with(
                     upstream_etag: page.etag,
                     upstream_serial: page.serial,
                     upstream_project_url: page.project_url,
-                    raw_body: page.body,
                     links,
                 };
                 let cached = state.cache.store_project(&record).await.map_err(|err| {
                     warn!(project, error = %err, "failed to store refreshed project page");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-                let hot_project = build_hot_project(display_project, file_base_path, cached);
-                cache_hot_project(state, project, hot_project.clone()).await;
+                let hot_project =
+                    materialize_project(state, project, display_project, file_base_path, cached)
+                        .await;
                 Ok(ProjectState::Ready(hot_project, false))
             }
             Ok(ProjectFetch::NotModified) => {
@@ -871,9 +1195,14 @@ async fn ensure_project_with(
                             warn!(project, error = %err, "failed to persist project revalidation");
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
-                    let hot_project =
-                        build_hot_project(display_project, file_base_path, cached_value);
-                    cache_hot_project(state, project, hot_project.clone()).await;
+                    let hot_project = materialize_project(
+                        state,
+                        project,
+                        display_project,
+                        file_base_path,
+                        cached_value,
+                    )
+                    .await;
                     Ok(ProjectState::Ready(hot_project, false))
                 } else {
                     Err(StatusCode::BAD_GATEWAY)
@@ -892,8 +1221,9 @@ async fn ensure_project_with(
         Err(status) => {
             if let Some(cached) = cached {
                 warn!(project, "serving stale project page after refresh failure");
-                let hot_project = build_hot_project(display_project, file_base_path, cached);
-                cache_hot_project(state, project, hot_project.clone()).await;
+                let hot_project =
+                    materialize_project(state, project, display_project, file_base_path, cached)
+                        .await;
                 Ok(ProjectState::Ready(hot_project, true))
             } else {
                 Err(status)
@@ -914,6 +1244,48 @@ fn build_hot_project(project: &str, file_base_path: &str, cache: ProjectCache) -
             json_body: Bytes::from(json_body),
         },
     })
+}
+
+fn hot_project_from_responses(responses: CachedProjectResponses) -> Arc<HotProject> {
+    Arc::new(HotProject {
+        cache: ProjectCache {
+            project: responses.project,
+            fetched_at: responses.fetched_at,
+            expires_at: responses.expires_at,
+            upstream_etag: responses.upstream_etag,
+            upstream_serial: responses.upstream_serial,
+            upstream_project_url: responses.upstream_project_url,
+            links: Vec::new(),
+        },
+        rendered: RenderedProject {
+            html_body: responses.html_body,
+            html_etag: responses.html_etag,
+            json_body: responses.json_body,
+            json_etag: responses.json_etag,
+        },
+    })
+}
+
+async fn materialize_project(
+    state: &AppState,
+    cache_project: &str,
+    display_project: &str,
+    file_base_path: &str,
+    cache: ProjectCache,
+) -> Arc<HotProject> {
+    let hot_project = build_hot_project(display_project, file_base_path, cache);
+    let record = ProjectResponseRecord {
+        project: cache_project.to_string(),
+        html_body: hot_project.rendered.html_body.clone(),
+        html_etag: hot_project.rendered.html_etag.clone(),
+        json_body: hot_project.rendered.json_body.clone(),
+        json_etag: hot_project.rendered.json_etag.clone(),
+    };
+    if let Err(err) = state.cache.store_project_responses(&record).await {
+        warn!(project = cache_project, error = %err, "failed to persist rendered project responses");
+    }
+    cache_hot_project(state, cache_project, hot_project.clone()).await;
+    hot_project
 }
 
 fn estimated_cached_link_bytes(link: &CachedLink) -> usize {
@@ -1842,7 +2214,7 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
     job.cache
         .commit_blob_file(&temp_path, &job.storage_relpath)
         .await?;
-    let blob = job
+    let ready = job
         .cache
         .mark_blob_ready(&BlobWrite {
             blob_kind: job.link.blob_kind.clone(),
@@ -1855,6 +2227,11 @@ async fn download_blob_task_inner(job: &DownloadJob) -> io::Result<()> {
             upstream_url: job.link.upstream_url.clone(),
         })
         .await?;
+    for project in &ready.projects {
+        job.hot_projects.invalidate(project);
+    }
+    job.hot_projects.run_pending_tasks();
+    let blob = ready.blob;
     if enforce_cache_size_after_download(job, &blob).await? {
         job.hot_blobs
             .insert(blob_key(&blob.blob_kind, &blob.blob_id), blob);
@@ -1991,11 +2368,12 @@ fn render_cached_simple_response(
     stale: bool,
 ) -> Response<Body> {
     if let Some(if_none_match) = header_value(headers, IF_NONE_MATCH)
-        && if_none_match.trim() == etag
+        && if_none_match_matches(if_none_match, &etag)
     {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         response.headers_mut().insert(ETAG, header(&etag));
+        apply_simple_vary(&mut response);
         if stale {
             response
                 .headers_mut()
@@ -2014,12 +2392,26 @@ fn render_cached_simple_response(
         header(&content_length.to_string()),
     );
     response.headers_mut().insert(ETAG, header(&etag));
+    apply_simple_vary(&mut response);
     if stale {
         response
             .headers_mut()
             .insert(WARNING, HeaderValue::from_static("110 - response is stale"));
     }
     response
+}
+
+fn apply_simple_vary(response: &mut Response<Body>) {
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("accept, accept-encoding"));
+}
+
+fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 fn text_response(status: StatusCode, body: &str) -> Response<Body> {
@@ -2106,7 +2498,6 @@ mod tests {
             upstream_etag: Some(format!("\"etag-{project}\"")),
             upstream_serial: Some(1),
             upstream_project_url: format!("https://example.invalid/simple/{project}/"),
-            raw_body: "<html></html>".to_string(),
             links: vec![test_link(0)],
         }
     }
@@ -2123,7 +2514,6 @@ mod tests {
                 upstream_etag: record.upstream_etag,
                 upstream_serial: record.upstream_serial,
                 upstream_project_url: record.upstream_project_url,
-                raw_body: record.raw_body,
                 links: record.links,
             },
         )
@@ -2185,6 +2575,7 @@ mod tests {
             locks: RequestLocks::default(),
             metrics: CacheMetrics::default(),
             active_blobs: ActiveBlobRegistry::default(),
+            active_project_refreshes: ActiveProjectRefreshRegistry::default(),
             hot_projects: hot_project_cache(),
             hot_links: ConcurrentCache::new(HOT_LINK_CACHE_MAX_ENTRIES as u64),
             hot_blobs: ConcurrentCache::new(HOT_BLOB_CACHE_MAX_ENTRIES as u64),
@@ -2274,7 +2665,6 @@ mod tests {
                 upstream_etag: None,
                 upstream_serial: None,
                 upstream_project_url: "https://download.pytorch.org/whl/cu126/torch/".to_string(),
-                raw_body: "<html></html>".to_string(),
                 links: vec![test_link(0)],
             },
         );
@@ -2529,9 +2919,69 @@ mod tests {
             &upstream.base_url,
         );
         state.cache.initialize().await.unwrap();
+        let cache = state.cache.clone();
+        let hot_projects = state.hot_projects.clone();
         let app = app(state);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .header(ACCEPT, json_media_type())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("public, max-age=")
+        );
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        for expected in ["accept", "accept-encoding"] {
+            assert!(
+                vary.split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case(expected))
+            );
+        }
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "demo");
+        assert_eq!(json["files"][0]["filename"], "demo-1.0.whl");
+        assert_eq!(
+            json["files"][0]["url"],
+            "/root/pypi/+f/9ce/b18f15662bb87/demo-1.0.whl"
+        );
+        assert!(
+            cache
+                .load_project_responses("demo")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(upstream.project_requests(), 1);
+
+        hot_projects.invalidate("demo");
+        hot_projects.run_pending_tasks();
+        let conn = Connection::open(temp.path().join("index.sqlite3")).unwrap();
+        conn.execute("DELETE FROM project_links WHERE project = 'demo'", [])
+            .unwrap();
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/simple/demo/")
@@ -2543,13 +2993,36 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["name"], "demo");
-        assert_eq!(json["files"][0]["filename"], "demo-1.0.whl");
         assert_eq!(
-            json["files"][0]["url"],
-            "/root/pypi/+f/9ce/b18f15662bb87/demo-1.0.whl"
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json
         );
+        assert_eq!(upstream.project_requests(), 1);
+
+        hot_projects.invalidate("demo");
+        hot_projects.run_pending_tasks();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .header(ACCEPT, json_media_type())
+                    .header(IF_NONE_MATCH, format!("\"other\", W/{etag}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG).unwrap(), etag.as_str());
+        assert!(response.headers().contains_key(CACHE_CONTROL));
+        let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
+        for expected in ["accept", "accept-encoding"] {
+            assert!(
+                vary.split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case(expected))
+            );
+        }
+        assert_eq!(upstream.project_requests(), 1);
     }
 
     #[tokio::test]
@@ -2593,6 +3066,20 @@ mod tests {
         assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"wheel-bytes");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<span class=\"badge-success\">cached</span>"));
+        assert!(!html.contains("<span class=\"muted\">not cached</span>"));
     }
 
     #[tokio::test]
@@ -3303,6 +3790,7 @@ mod tests {
         );
         state.project_cache_ttl_secs = 0;
         state.cache.initialize().await.unwrap();
+        let active_refreshes = state.active_project_refreshes.clone();
         let app = app(state);
 
         let _ = app
@@ -3333,6 +3821,28 @@ mod tests {
             response.headers().get(WARNING).unwrap(),
             "110 - response is stale"
         );
+
+        for _ in 0..100 {
+            if upstream.project_requests() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(upstream.project_requests(), 2);
+        assert_eq!(active_refreshes.len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(upstream.project_requests(), 2);
     }
 
     #[tokio::test]
@@ -3385,12 +3895,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_project_returns_immediately_and_coalesces_background_refresh() {
+        let upstream = spawn_slow_project_upstream(Duration::from_millis(500)).await;
+        let temp = tempdir().unwrap();
+        let state = test_state(
+            CacheStore::new(temp.path().to_path_buf()),
+            &upstream.base_url,
+        );
+        state.cache.initialize().await.unwrap();
+        let mut record = test_project_record("demo");
+        record.expires_at = 0;
+        state.cache.store_project(&record).await.unwrap();
+        let cache = state.cache.clone();
+        let active_refreshes = state.active_project_refreshes.clone();
+        let app = app(state);
+
+        for _ in 0..6 {
+            let response = tokio::time::timeout(
+                Duration::from_millis(200),
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/simple/demo/")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("stale response waited for the upstream refresh")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(WARNING).unwrap(),
+                "110 - response is stale"
+            );
+        }
+
+        for _ in 0..100 {
+            if upstream.project_requests() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(upstream.project_requests(), 1);
+        assert_eq!(active_refreshes.len(), 1);
+
+        for _ in 0..100 {
+            let fresh = cache
+                .load_project("demo")
+                .await
+                .unwrap()
+                .is_some_and(|project| cache.project_is_fresh(&project));
+            if fresh && active_refreshes.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cache
+                .load_project("demo")
+                .await
+                .unwrap()
+                .is_some_and(|project| cache.project_is_fresh(&project))
+        );
+        assert!(active_refreshes.is_empty());
+        assert_eq!(upstream.project_requests(), 1);
+    }
+
     async fn spawn_upstream() -> TestUpstream {
         spawn_upstream_with_slow_file(false).await
     }
 
     async fn spawn_slow_upstream() -> TestUpstream {
         spawn_upstream_with_slow_file(true).await
+    }
+
+    async fn spawn_slow_project_upstream(project_delay: Duration) -> TestUpstream {
+        let data = Bytes::from_static(b"wheel-bytes");
+        spawn_test_upstream(data.clone(), data.len(), Duration::ZERO, project_delay).await
     }
 
     async fn spawn_upstream_with_slow_file(slow_file: bool) -> TestUpstream {
@@ -3409,9 +3991,19 @@ mod tests {
         chunk_bytes: usize,
         chunk_delay: Duration,
     ) -> TestUpstream {
+        spawn_test_upstream(data, chunk_bytes, chunk_delay, Duration::ZERO).await
+    }
+
+    async fn spawn_test_upstream(
+        data: Bytes,
+        chunk_bytes: usize,
+        chunk_delay: Duration,
+        project_delay: Duration,
+    ) -> TestUpstream {
         let metadata = Bytes::from_static(b"metadata-bytes");
         let state = Arc::new(TestUpstreamState {
             broken: Mutex::new(false),
+            project_requests: AtomicUsize::new(0),
             file_requests: AtomicUsize::new(0),
             metadata_requests: AtomicUsize::new(0),
             chunks_sent: AtomicUsize::new(0),
@@ -3421,6 +4013,7 @@ mod tests {
             metadata,
             chunk_bytes,
             chunk_delay,
+            project_delay,
         });
         let app = Router::new()
             .route("/simple/demo/", get(upstream_demo))
@@ -3442,9 +4035,19 @@ mod tests {
         State(state): State<Arc<TestUpstreamState>>,
         headers: HeaderMap,
     ) -> Response<Body> {
+        state.project_requests.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(state.project_delay).await;
         if *state.broken.lock().await {
             let mut response = Response::new(Body::from("boom"));
             *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
+        }
+        if header_value(&headers, IF_NONE_MATCH) == Some("\"etag-demo\"") {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NOT_MODIFIED;
+            response
+                .headers_mut()
+                .insert(ETAG, HeaderValue::from_static("\"etag-demo\""));
             return response;
         }
         if wants_json(header_value(&headers, ACCEPT)) {
@@ -3574,6 +4177,10 @@ mod tests {
     }
 
     impl TestUpstream {
+        fn project_requests(&self) -> usize {
+            self.state.project_requests.load(Ordering::SeqCst)
+        }
+
         fn file_requests(&self) -> usize {
             self.state.file_requests.load(Ordering::SeqCst)
         }
@@ -3589,6 +4196,7 @@ mod tests {
 
     struct TestUpstreamState {
         broken: Mutex<bool>,
+        project_requests: AtomicUsize,
         file_requests: AtomicUsize,
         metadata_requests: AtomicUsize,
         chunks_sent: AtomicUsize,
@@ -3598,5 +4206,6 @@ mod tests {
         metadata: Bytes,
         chunk_bytes: usize,
         chunk_delay: Duration,
+        project_delay: Duration,
     }
 }

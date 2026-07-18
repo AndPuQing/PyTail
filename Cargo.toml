@@ -56,6 +56,7 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

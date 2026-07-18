@@ -171,8 +171,8 @@ fn seed_db(
         tx.execute(
             "INSERT INTO projects (
                 project, fetched_at, expires_at, upstream_etag, upstream_serial,
-                upstream_project_url, raw_body
-             ) VALUES (?1, 1, 3601, NULL, NULL, ?2, '')",
+                upstream_project_url
+             ) VALUES (?1, 1, 3601, NULL, NULL, ?2)",
             params![project, format!("https://example.test/simple/{project}/")],
         )?;
         for link_index in 0..links_per_project {

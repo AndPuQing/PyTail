@@ -1,4 +1,5 @@
 use crate::simple::normalize_project_name;
+use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -7,12 +8,16 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::Mutex;
+use tracing::info;
 
 const BLOB_STATE_PENDING: &str = "pending";
 const BLOB_STATE_READY: &str = "ready";
+const CACHE_SCHEMA_VERSION: u32 = 2;
+const PROJECT_RESPONSE_COMPRESSION_LEVEL: i32 = 1;
+const MAX_PROJECT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static SQLITE_CONNECTIONS: RefCell<HashMap<PathBuf, Connection>> = RefCell::new(HashMap::new());
@@ -74,7 +79,6 @@ pub struct ProjectCache {
     pub upstream_etag: Option<String>,
     pub upstream_serial: Option<u64>,
     pub upstream_project_url: String,
-    pub raw_body: String,
     pub links: Vec<CachedLink>,
 }
 
@@ -89,6 +93,12 @@ pub struct BlobInfo {
     pub filename: String,
     pub upstream_url: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobReadyResult {
+    pub blob: BlobInfo,
+    pub projects: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,8 +132,53 @@ pub struct ProjectRecord {
     pub upstream_etag: Option<String>,
     pub upstream_serial: Option<u64>,
     pub upstream_project_url: String,
-    pub raw_body: String,
     pub links: Vec<CachedLink>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectResponseFormat {
+    Html,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedProjectResponses {
+    pub project: String,
+    pub fetched_at: u64,
+    pub expires_at: u64,
+    pub upstream_etag: Option<String>,
+    pub upstream_serial: Option<u64>,
+    pub upstream_project_url: String,
+    pub html_body: Bytes,
+    pub html_etag: String,
+    pub json_body: Bytes,
+    pub json_etag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectResponseRecord {
+    pub project: String,
+    pub html_body: Bytes,
+    pub html_etag: String,
+    pub json_body: Bytes,
+    pub json_etag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectResponseValidator {
+    pub expires_at: u64,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompressedProjectResponseRecord {
+    project: String,
+    html_body: Vec<u8>,
+    html_size: usize,
+    html_etag: String,
+    json_body: Vec<u8>,
+    json_size: usize,
+    json_etag: String,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +318,43 @@ impl CacheStore {
         let db_path = self.db_path.clone();
         let record = record.clone();
         tokio::task::spawn_blocking(move || store_project_db(&db_path, &record))
+            .await
+            .map_err(join_error)?
+    }
+
+    pub async fn load_project_responses(
+        &self,
+        project: &str,
+    ) -> io::Result<Option<CachedProjectResponses>> {
+        let db_path = self.db_path.clone();
+        let project = normalize_project_name(project);
+        tokio::task::spawn_blocking(move || load_project_responses_db(&db_path, &project))
+            .await
+            .map_err(join_error)?
+    }
+
+    pub async fn load_project_response_validator(
+        &self,
+        project: &str,
+        format: ProjectResponseFormat,
+    ) -> io::Result<Option<ProjectResponseValidator>> {
+        let db_path = self.db_path.clone();
+        let project = normalize_project_name(project);
+        tokio::task::spawn_blocking(move || {
+            load_project_response_validator_db(&db_path, &project, format)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn store_project_responses(&self, record: &ProjectResponseRecord) -> io::Result<()> {
+        let record = record.clone();
+        let record = tokio::task::spawn_blocking(move || compress_project_responses(&record))
+            .await
+            .map_err(join_error)??;
+        let _write_guard = self.db_write_lock.lock().await;
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || store_project_responses_db(&db_path, &record))
             .await
             .map_err(join_error)?
     }
@@ -460,7 +552,7 @@ impl CacheStore {
         }
     }
 
-    pub async fn mark_blob_ready(&self, blob: &BlobWrite) -> io::Result<BlobInfo> {
+    pub async fn mark_blob_ready(&self, blob: &BlobWrite) -> io::Result<BlobReadyResult> {
         let _write_guard = self.db_write_lock.lock().await;
         let db_path = self.db_path.clone();
         let blob = blob.clone();
@@ -510,20 +602,28 @@ impl CacheStore {
                     }
                     projects
                 };
-                for project in projects {
-                    update_project_stats_tx(&tx, &project)?;
+                for project in &projects {
+                    tx.execute(
+                        "DELETE FROM project_responses WHERE project = ?1",
+                        params![project],
+                    )
+                    .map_err(sqlite_error)?;
+                    update_project_stats_tx(&tx, project)?;
                 }
                 tx.commit().map_err(sqlite_error)?;
-                Ok(BlobInfo {
-                    blob_kind: blob.blob_kind,
-                    blob_id: blob.blob_id,
-                    storage_relpath: blob.storage_relpath,
-                    content_type: blob.content_type,
-                    fetched_at: blob.fetched_at,
-                    size_bytes: blob.size_bytes,
-                    filename: blob.filename,
-                    upstream_url: blob.upstream_url,
-                    state: BLOB_STATE_READY.to_string(),
+                Ok(BlobReadyResult {
+                    blob: BlobInfo {
+                        blob_kind: blob.blob_kind,
+                        blob_id: blob.blob_id,
+                        storage_relpath: blob.storage_relpath,
+                        content_type: blob.content_type,
+                        fetched_at: blob.fetched_at,
+                        size_bytes: blob.size_bytes,
+                        filename: blob.filename,
+                        upstream_url: blob.upstream_url,
+                        state: BLOB_STATE_READY.to_string(),
+                    },
+                    projects,
                 })
             })
         })
@@ -755,7 +855,7 @@ fn init_db(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = open_db(path)?;
+    let mut conn = open_db(path)?;
     conn.execute_batch(
         "
         PRAGMA journal_mode=WAL;
@@ -769,8 +869,7 @@ fn init_db(path: &Path) -> io::Result<()> {
             expires_at INTEGER NOT NULL,
             upstream_etag TEXT,
             upstream_serial INTEGER,
-            upstream_project_url TEXT NOT NULL,
-            raw_body TEXT NOT NULL
+            upstream_project_url TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS project_links (
@@ -787,8 +886,7 @@ fn init_db(path: &Path) -> io::Result<()> {
             core_metadata TEXT,
             hash_name TEXT,
             hash_value TEXT,
-            PRIMARY KEY (project, position),
-            UNIQUE (project, filename, upstream_url)
+            PRIMARY KEY (project, position)
         );
 
         CREATE TABLE IF NOT EXISTS blobs (
@@ -806,17 +904,21 @@ fn init_db(path: &Path) -> io::Result<()> {
             UNIQUE (storage_relpath)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_project_links_blob_lookup
-            ON project_links (blob_kind, blob_id, filename);
-
-        CREATE INDEX IF NOT EXISTS idx_project_links_project_order
-            ON project_links (project, position);
-
         CREATE INDEX IF NOT EXISTS idx_blobs_state_size
             ON blobs (state, size_bytes);
 
         CREATE INDEX IF NOT EXISTS idx_blobs_state_fetched_at
             ON blobs (state, fetched_at);
+
+        CREATE TABLE IF NOT EXISTS project_responses (
+            project TEXT PRIMARY KEY,
+            html_body BLOB NOT NULL,
+            html_size INTEGER NOT NULL,
+            html_etag TEXT NOT NULL,
+            json_body BLOB NOT NULL,
+            json_size INTEGER NOT NULL,
+            json_etag TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS project_stats (
             project TEXT PRIMARY KEY,
@@ -834,8 +936,176 @@ fn init_db(path: &Path) -> io::Result<()> {
         ",
     )
     .map_err(sqlite_error)?;
+    let project_metadata_changed = migrate_project_metadata_schema(&mut conn)?;
+    let project_response_schema_changed = migrate_project_response_schema(&mut conn)?;
     migrate_blob_access_times(&conn)?;
     backfill_project_stats(&conn)?;
+    finish_project_metadata_migration(
+        &conn,
+        path,
+        project_metadata_changed || project_response_schema_changed,
+    )?;
+    Ok(())
+}
+
+fn migrate_project_response_schema(conn: &mut Connection) -> io::Result<bool> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    if table_has_column(&tx, "project_responses", "html_size")? {
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "
+        DROP TABLE project_responses;
+        CREATE TABLE project_responses (
+            project TEXT PRIMARY KEY,
+            html_body BLOB NOT NULL,
+            html_size INTEGER NOT NULL,
+            html_etag TEXT NOT NULL,
+            json_body BLOB NOT NULL,
+            json_size INTEGER NOT NULL,
+            json_etag TEXT NOT NULL
+        );
+        ",
+    )
+    .map_err(sqlite_error)?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
+fn migrate_project_metadata_schema(conn: &mut Connection) -> io::Result<bool> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let migrate_projects = table_has_column(&tx, "projects", "raw_body")?;
+    let migrate_project_links = table_has_unique_index_columns(
+        &tx,
+        "project_links",
+        &["project", "filename", "upstream_url"],
+    )?;
+    let drop_redundant_order_index = index_exists(&tx, "idx_project_links_project_order")?;
+    let changed = migrate_projects || migrate_project_links || drop_redundant_order_index;
+
+    if migrate_projects {
+        tx.execute_batch(
+            "
+            DROP TABLE IF EXISTS projects_migrated;
+            CREATE TABLE projects_migrated (
+                project TEXT PRIMARY KEY,
+                fetched_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                upstream_etag TEXT,
+                upstream_serial INTEGER,
+                upstream_project_url TEXT NOT NULL
+            );
+            INSERT INTO projects_migrated (
+                project, fetched_at, expires_at, upstream_etag, upstream_serial,
+                upstream_project_url
+            )
+            SELECT
+                project, fetched_at, expires_at, upstream_etag, upstream_serial,
+                upstream_project_url
+            FROM projects;
+            DROP TABLE projects;
+            ALTER TABLE projects_migrated RENAME TO projects;
+            ",
+        )
+        .map_err(sqlite_error)?;
+    }
+
+    if migrate_project_links {
+        tx.execute_batch(
+            "
+            DROP TABLE IF EXISTS project_links_migrated;
+            CREATE TABLE project_links_migrated (
+                project TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                upstream_url TEXT NOT NULL,
+                blob_kind TEXT NOT NULL,
+                blob_id TEXT NOT NULL,
+                requires_python TEXT,
+                yanked TEXT,
+                gpg_sig INTEGER,
+                dist_info_metadata TEXT,
+                core_metadata TEXT,
+                hash_name TEXT,
+                hash_value TEXT,
+                PRIMARY KEY (project, position)
+            );
+            INSERT INTO project_links_migrated (
+                project, position, filename, upstream_url, blob_kind, blob_id,
+                requires_python, yanked, gpg_sig, dist_info_metadata, core_metadata,
+                hash_name, hash_value
+            )
+            SELECT
+                project, position, filename, upstream_url, blob_kind, blob_id,
+                requires_python, yanked, gpg_sig, dist_info_metadata, core_metadata,
+                hash_name, hash_value
+            FROM project_links
+            ORDER BY project, position;
+            DROP TABLE project_links;
+            ALTER TABLE project_links_migrated RENAME TO project_links;
+            ",
+        )
+        .map_err(sqlite_error)?;
+    } else if drop_redundant_order_index {
+        tx.execute("DROP INDEX idx_project_links_project_order", [])
+            .map_err(sqlite_error)?;
+    }
+
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_links_blob_lookup
+         ON project_links (blob_kind, blob_id, filename)",
+        [],
+    )
+    .map_err(sqlite_error)?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(changed)
+}
+
+fn finish_project_metadata_migration(
+    conn: &Connection,
+    path: &Path,
+    schema_changed: bool,
+) -> io::Result<()> {
+    let schema_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .map_err(sqlite_error)?;
+    let freelist_pages = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get::<_, u64>(0))
+        .map_err(sqlite_error)?;
+    let should_compact =
+        schema_changed || (schema_version < CACHE_SCHEMA_VERSION && freelist_pages > 0);
+
+    if should_compact {
+        let before_bytes = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let started = Instant::now();
+        info!(
+            database = %path.display(),
+            before_bytes,
+            freelist_pages,
+            "compacting migrated cache database"
+        );
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(sqlite_error)?;
+        let after_bytes = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        info!(
+            database = %path.display(),
+            before_bytes,
+            after_bytes,
+            reclaimed_bytes = before_bytes.saturating_sub(after_bytes),
+            elapsed_ms = started.elapsed().as_millis(),
+            "compacted migrated cache database"
+        );
+    }
+
+    if schema_version < CACHE_SCHEMA_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {CACHE_SCHEMA_VERSION};"))
+            .map_err(sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -877,6 +1147,62 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> io::Result<
         }
     }
     Ok(false)
+}
+
+fn table_has_unique_index_columns(
+    conn: &Connection,
+    table: &str,
+    expected_columns: &[&str],
+) -> io::Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA index_list({table})"))
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })
+        .map_err(sqlite_error)?;
+    let mut unique_indexes = Vec::new();
+    for row in rows {
+        let (name, unique) = row.map_err(sqlite_error)?;
+        if unique {
+            unique_indexes.push(name);
+        }
+    }
+    drop(stmt);
+
+    for index in unique_indexes {
+        let quoted_index = index.replace('"', "\"\"");
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_info(\"{quoted_index}\")"))
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(sqlite_error)?;
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(sqlite_error)?);
+        }
+        if columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn index_exists(conn: &Connection, index: &str) -> io::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1
+         )",
+        params![index],
+        |row| row.get(0),
+    )
+    .map_err(sqlite_error)
 }
 
 fn prune_cache_to_size_db(
@@ -956,6 +1282,11 @@ fn prune_cache_to_size_db(
     }
 
     for project in changed_projects {
+        tx.execute(
+            "DELETE FROM project_responses WHERE project = ?1",
+            params![project],
+        )
+        .map_err(sqlite_error)?;
         update_project_stats_tx(&tx, &project)?;
     }
     tx.commit().map_err(sqlite_error)?;
@@ -1076,11 +1407,186 @@ fn update_project_stats_tx(tx: &rusqlite::Transaction<'_>, project: &str) -> io:
     Ok(())
 }
 
+fn load_project_responses_db(
+    path: &Path,
+    project: &str,
+) -> io::Result<Option<CachedProjectResponses>> {
+    with_db(path, |conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT
+                    p.fetched_at, p.expires_at, p.upstream_etag, p.upstream_serial,
+                    p.upstream_project_url, r.html_body, r.html_size, r.html_etag,
+                    r.json_body, r.json_size, r.json_etag
+                 FROM projects p
+                 JOIN project_responses r ON r.project = p.project
+                 WHERE p.project = ?1",
+            )
+            .map_err(sqlite_error)?;
+        let row = stmt
+            .query_row(params![project], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some((
+            fetched_at,
+            expires_at,
+            upstream_etag,
+            upstream_serial,
+            upstream_project_url,
+            html_body,
+            html_size,
+            html_etag,
+            json_body,
+            json_size,
+            json_etag,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CachedProjectResponses {
+            project: project.to_string(),
+            fetched_at,
+            expires_at,
+            upstream_etag,
+            upstream_serial,
+            upstream_project_url,
+            html_body: Bytes::from(decompress_project_response(&html_body, html_size)?),
+            html_etag,
+            json_body: Bytes::from(decompress_project_response(&json_body, json_size)?),
+            json_etag,
+        }))
+    })
+}
+
+fn load_project_response_validator_db(
+    path: &Path,
+    project: &str,
+    format: ProjectResponseFormat,
+) -> io::Result<Option<ProjectResponseValidator>> {
+    with_db(path, |conn| {
+        let sql = match format {
+            ProjectResponseFormat::Html => {
+                "SELECT p.expires_at, r.html_etag
+                 FROM projects p
+                 JOIN project_responses r ON r.project = p.project
+                 WHERE p.project = ?1"
+            }
+            ProjectResponseFormat::Json => {
+                "SELECT p.expires_at, r.json_etag
+                 FROM projects p
+                 JOIN project_responses r ON r.project = p.project
+                 WHERE p.project = ?1"
+            }
+        };
+        let mut stmt = conn.prepare_cached(sql).map_err(sqlite_error)?;
+        stmt.query_row(params![project], |row| {
+            Ok(ProjectResponseValidator {
+                expires_at: row.get(0)?,
+                etag: row.get(1)?,
+            })
+        })
+        .optional()
+        .map_err(sqlite_error)
+    })
+}
+
+fn compress_project_responses(
+    record: &ProjectResponseRecord,
+) -> io::Result<CompressedProjectResponseRecord> {
+    for (format, body) in [("HTML", &record.html_body), ("JSON", &record.json_body)] {
+        if body.len() > MAX_PROJECT_RESPONSE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("materialized project {format} exceeds size limit"),
+            ));
+        }
+    }
+    Ok(CompressedProjectResponseRecord {
+        project: record.project.clone(),
+        html_body: zstd::bulk::compress(
+            record.html_body.as_ref(),
+            PROJECT_RESPONSE_COMPRESSION_LEVEL,
+        )
+        .map_err(io::Error::other)?,
+        html_size: record.html_body.len(),
+        html_etag: record.html_etag.clone(),
+        json_body: zstd::bulk::compress(
+            record.json_body.as_ref(),
+            PROJECT_RESPONSE_COMPRESSION_LEVEL,
+        )
+        .map_err(io::Error::other)?,
+        json_size: record.json_body.len(),
+        json_etag: record.json_etag.clone(),
+    })
+}
+
+fn decompress_project_response(body: &[u8], size: u64) -> io::Result<Vec<u8>> {
+    let size = usize::try_from(size)
+        .ok()
+        .filter(|size| *size <= MAX_PROJECT_RESPONSE_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid project response size")
+        })?;
+    let decompressed = zstd::bulk::decompress(body, size).map_err(io::Error::other)?;
+    if decompressed.len() != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "materialized project response size mismatch",
+        ));
+    }
+    Ok(decompressed)
+}
+
+fn store_project_responses_db(
+    path: &Path,
+    record: &CompressedProjectResponseRecord,
+) -> io::Result<()> {
+    with_db(path, |conn| {
+        conn.execute(
+            "INSERT INTO project_responses (
+                project, html_body, html_size, html_etag, json_body, json_size, json_etag
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project) DO UPDATE SET
+                html_body = excluded.html_body,
+                html_size = excluded.html_size,
+                html_etag = excluded.html_etag,
+                json_body = excluded.json_body,
+                json_size = excluded.json_size,
+                json_etag = excluded.json_etag",
+            params![
+                record.project,
+                record.html_body,
+                record.html_size,
+                record.html_etag,
+                record.json_body,
+                record.json_size,
+                record.json_etag,
+            ],
+        )
+        .map_err(sqlite_error)?;
+        Ok(())
+    })
+}
+
 fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache>> {
     with_db(path, |conn| {
         let mut project_stmt = conn
             .prepare_cached(
-            "SELECT fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url, raw_body
+            "SELECT fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url
              FROM projects WHERE project = ?1",
             )
             .map_err(sqlite_error)?;
@@ -1092,19 +1598,12 @@ fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<u64>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
                 ))
             })
             .optional()
             .map_err(sqlite_error)?;
-        let Some((
-            fetched_at,
-            expires_at,
-            upstream_etag,
-            upstream_serial,
-            upstream_project_url,
-            raw_body,
-        )) = row
+        let Some((fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url)) =
+            row
         else {
             return Ok(None);
         };
@@ -1155,7 +1654,6 @@ fn load_project_db(path: &Path, project: &str) -> io::Result<Option<ProjectCache
             upstream_etag,
             upstream_serial,
             upstream_project_url,
-            raw_body,
             links,
         }))
     })
@@ -1165,33 +1663,36 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
     with_db(path, |conn| {
         let tx = conn.transaction().map_err(sqlite_error)?;
         tx.execute(
-        "INSERT INTO projects (
-            project, fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url, raw_body
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO projects (
+            project, fetched_at, expires_at, upstream_etag, upstream_serial, upstream_project_url
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(project) DO UPDATE SET
             fetched_at = excluded.fetched_at,
             expires_at = excluded.expires_at,
             upstream_etag = excluded.upstream_etag,
             upstream_serial = excluded.upstream_serial,
-            upstream_project_url = excluded.upstream_project_url,
-            raw_body = excluded.raw_body",
-        params![
-            record.project,
-            record.fetched_at,
-            record.expires_at,
-            record.upstream_etag,
-            record.upstream_serial,
-            record.upstream_project_url,
-            record.raw_body,
-        ],
-    )
-    .map_err(sqlite_error)?;
+            upstream_project_url = excluded.upstream_project_url",
+            params![
+                record.project,
+                record.fetched_at,
+                record.expires_at,
+                record.upstream_etag,
+                record.upstream_serial,
+                record.upstream_project_url,
+            ],
+        )
+        .map_err(sqlite_error)?;
+        tx.execute(
+            "DELETE FROM project_responses WHERE project = ?1",
+            params![record.project],
+        )
+        .map_err(sqlite_error)?;
         tx.execute(
             "DELETE FROM project_links WHERE project = ?1",
             params![record.project],
         )
         .map_err(sqlite_error)?;
-        {
+        let stored_links = {
             let mut insert_link = tx
                 .prepare(
                 "INSERT INTO project_links (
@@ -1200,7 +1701,13 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )
             .map_err(sqlite_error)?;
-            for (position, link) in record.links.iter().enumerate() {
+            let mut seen = HashSet::with_capacity(record.links.len());
+            let mut stored_links = Vec::with_capacity(record.links.len());
+            for link in &record.links {
+                if !seen.insert((link.filename.as_str(), link.upstream_url.as_str())) {
+                    continue;
+                }
+                let position = stored_links.len();
                 insert_link
                     .execute(params![
                         record.project,
@@ -1218,8 +1725,10 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
                         link.hash_value,
                     ])
                     .map_err(sqlite_error)?;
+                stored_links.push(link.clone());
             }
-        }
+            stored_links
+        };
         update_project_stats_tx(&tx, &record.project)?;
         tx.commit().map_err(sqlite_error)?;
         Ok(ProjectCache {
@@ -1229,8 +1738,7 @@ fn store_project_db(path: &Path, record: &ProjectRecord) -> io::Result<ProjectCa
             upstream_etag: record.upstream_etag.clone(),
             upstream_serial: record.upstream_serial,
             upstream_project_url: record.upstream_project_url.clone(),
-            raw_body: record.raw_body.clone(),
-            links: record.links.clone(),
+            links: stored_links,
         })
     })
 }
@@ -1387,14 +1895,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let cache = CacheStore::new(temp.path().to_path_buf());
         cache.initialize().await.unwrap();
-        let record = ProjectRecord {
+        let mut record = ProjectRecord {
             project: "requests".to_string(),
             fetched_at: 1,
             expires_at: 10,
             upstream_etag: Some("abc".to_string()),
             upstream_serial: Some(42),
             upstream_project_url: "https://example/simple/requests/".to_string(),
-            raw_body: "<html></html>".to_string(),
             links: vec![CachedLink {
                 filename: "requests-1.0.whl".to_string(),
                 upstream_url: "https://files.example/requests-1.0.whl".to_string(),
@@ -1410,14 +1917,29 @@ mod tests {
                 hash_value: Some("deadbeef".to_string()),
             }],
         };
+        let mut duplicate = record.links[0].clone();
+        duplicate.blob_id = "ignored-duplicate".to_string();
+        duplicate.hash_value = Some("ignored-duplicate".to_string());
+        record.links.push(duplicate);
 
-        cache.store_project(&record).await.unwrap();
+        let stored = cache.store_project(&record).await.unwrap();
+        assert_eq!(stored.links.len(), 1);
         let loaded = cache.load_project("Requests").await.unwrap().unwrap();
         assert_eq!(loaded.project, "requests");
         assert_eq!(loaded.upstream_serial, Some(42));
         assert_eq!(loaded.links.len(), 1);
         assert_eq!(loaded.links[0].blob_id, "deadbeef");
         assert_eq!(loaded.links[0].cached_size_bytes, None);
+        cache
+            .store_project_responses(&ProjectResponseRecord {
+                project: "requests".to_string(),
+                html_body: Bytes::from_static(b"<html>requests</html>"),
+                html_etag: "html-etag".to_string(),
+                json_body: Bytes::from_static(br#"{"name":"requests"}"#),
+                json_etag: "json-etag".to_string(),
+            })
+            .await
+            .unwrap();
 
         cache
             .mark_blob_pending(
@@ -1429,7 +1951,7 @@ mod tests {
             )
             .await
             .unwrap();
-        cache
+        let ready = cache
             .mark_blob_ready(&BlobWrite {
                 blob_kind: "sha256".to_string(),
                 blob_id: "deadbeef".to_string(),
@@ -1442,6 +1964,14 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(ready.projects, ["requests"]);
+        assert!(
+            cache
+                .load_project_responses("requests")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let loaded = cache.load_project("requests").await.unwrap().unwrap();
         assert_eq!(loaded.links[0].cached_size_bytes, Some(1234));
@@ -1462,6 +1992,183 @@ mod tests {
         let snapshot = cache.root_dashboard_snapshot_since(0).await.unwrap();
         assert_eq!(snapshot.projects, summaries);
         assert_eq!(snapshot.cache_summary, summary);
+    }
+
+    #[tokio::test]
+    async fn stores_validates_and_invalidates_materialized_project_responses() {
+        let temp = tempdir().unwrap();
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        let record = ProjectRecord {
+            project: "demo".to_string(),
+            fetched_at: 10,
+            expires_at: 20,
+            upstream_etag: Some("upstream-etag".to_string()),
+            upstream_serial: Some(42),
+            upstream_project_url: "https://example/simple/demo/".to_string(),
+            links: Vec::new(),
+        };
+        cache.store_project(&record).await.unwrap();
+        cache
+            .store_project_responses(&ProjectResponseRecord {
+                project: "demo".to_string(),
+                html_body: Bytes::from_static(b"<html>demo</html>"),
+                html_etag: "html-etag".to_string(),
+                json_body: Bytes::from_static(br#"{"name":"demo"}"#),
+                json_etag: "json-etag".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let responses = cache.load_project_responses("Demo").await.unwrap().unwrap();
+        assert_eq!(responses.expires_at, 20);
+        assert_eq!(responses.upstream_serial, Some(42));
+        assert_eq!(responses.html_body, "<html>demo</html>");
+        assert_eq!(responses.json_body, r#"{"name":"demo"}"#);
+        assert_eq!(
+            cache
+                .load_project_response_validator("demo", ProjectResponseFormat::Html)
+                .await
+                .unwrap()
+                .unwrap(),
+            ProjectResponseValidator {
+                expires_at: 20,
+                etag: "html-etag".to_string(),
+            }
+        );
+        assert_eq!(
+            cache
+                .load_project_response_validator("demo", ProjectResponseFormat::Json)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag,
+            "json-etag"
+        );
+
+        cache.touch_project("demo", 15, 30).await.unwrap();
+        assert_eq!(
+            cache
+                .load_project_response_validator("demo", ProjectResponseFormat::Json)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            30
+        );
+
+        cache.store_project(&record).await.unwrap();
+        assert!(
+            cache
+                .load_project_responses("demo")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_compacts_legacy_project_metadata_schema() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE projects (
+                    project TEXT PRIMARY KEY,
+                    fetched_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    upstream_etag TEXT,
+                    upstream_serial INTEGER,
+                    upstream_project_url TEXT NOT NULL,
+                    raw_body TEXT NOT NULL
+                );
+                CREATE TABLE project_links (
+                    project TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    upstream_url TEXT NOT NULL,
+                    blob_kind TEXT NOT NULL,
+                    blob_id TEXT NOT NULL,
+                    requires_python TEXT,
+                    yanked TEXT,
+                    gpg_sig INTEGER,
+                    dist_info_metadata TEXT,
+                    core_metadata TEXT,
+                    hash_name TEXT,
+                    hash_value TEXT,
+                    PRIMARY KEY (project, position),
+                    UNIQUE (project, filename, upstream_url)
+                );
+                CREATE INDEX idx_project_links_blob_lookup
+                    ON project_links (blob_kind, blob_id, filename);
+                CREATE INDEX idx_project_links_project_order
+                    ON project_links (project, position);
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects (
+                    project, fetched_at, expires_at, upstream_etag, upstream_serial,
+                    upstream_project_url, raw_body
+                 ) VALUES ('demo', 1, 10, 'etag', 42,
+                    'https://example/simple/demo/', ?1)",
+                params!["x".repeat(2 * 1024 * 1024)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_links (
+                    project, position, filename, upstream_url, blob_kind, blob_id,
+                    requires_python, yanked, gpg_sig, dist_info_metadata, core_metadata,
+                    hash_name, hash_value
+                 ) VALUES (
+                    'demo', 0, 'demo.whl', 'https://files.example/demo.whl',
+                    'sha256', 'deadbeef', NULL, NULL, NULL, NULL, NULL,
+                    'sha256', 'deadbeef'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let before_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        let cache = CacheStore::new(temp.path().to_path_buf());
+        cache.initialize().await.unwrap();
+        let after_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        let loaded = cache.load_project("demo").await.unwrap().unwrap();
+        assert_eq!(loaded.upstream_serial, Some(42));
+        assert_eq!(loaded.links.len(), 1);
+        assert_eq!(loaded.links[0].filename, "demo.whl");
+        with_db(&cache.db_path, |conn| {
+            assert!(!table_has_column(conn, "projects", "raw_body")?);
+            assert!(!table_has_unique_index_columns(
+                conn,
+                "project_links",
+                &["project", "filename", "upstream_url"],
+            )?);
+            assert!(!index_exists(conn, "idx_project_links_project_order")?);
+            assert!(index_exists(conn, "idx_project_links_blob_lookup")?);
+            let schema_version = conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .map_err(sqlite_error)?;
+            let freelist_pages = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get::<_, u64>(0))
+                .map_err(sqlite_error)?;
+            let integrity = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error)?;
+            assert_eq!(schema_version, CACHE_SCHEMA_VERSION);
+            assert_eq!(freelist_pages, 0);
+            assert_eq!(integrity, "ok");
+            Ok(())
+        })
+        .unwrap();
+        assert!(after_bytes < before_bytes / 2);
+
+        cache.initialize().await.unwrap();
+        assert_eq!(std::fs::metadata(&db_path).unwrap().len(), after_bytes);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1504,7 +2211,6 @@ mod tests {
                         upstream_etag: None,
                         upstream_serial: None,
                         upstream_project_url: format!("https://example/simple/{project}/"),
-                        raw_body: "<html></html>".to_string(),
                         links,
                     })
                     .await
@@ -1542,7 +2248,6 @@ mod tests {
                 upstream_serial: None,
                 upstream_project_url: "https://download.pytorch.org/whl/cu126/setuptools/"
                     .to_string(),
-                raw_body: "<html></html>".to_string(),
                 links: Vec::new(),
             })
             .await
@@ -1631,7 +2336,8 @@ mod tests {
                 upstream_url: "https://example/demo.whl".to_string(),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .blob;
         assert_eq!(blob.storage_relpath, relpath);
         let bytes = cache.load_blob_bytes(&relpath).await.unwrap().unwrap();
         assert_eq!(bytes, b"wheel");
@@ -1659,7 +2365,6 @@ mod tests {
                 upstream_etag: None,
                 upstream_serial: None,
                 upstream_project_url: "https://example/simple/demo/".to_string(),
-                raw_body: "<html></html>".to_string(),
                 links: vec![
                     CachedLink {
                         filename: "first.whl".to_string(),
@@ -1723,6 +2428,23 @@ mod tests {
                 .await
                 .unwrap();
         }
+        cache
+            .store_project_responses(&ProjectResponseRecord {
+                project: "demo".to_string(),
+                html_body: Bytes::from_static(b"<html>demo</html>"),
+                html_etag: "html-etag".to_string(),
+                json_body: Bytes::from_static(br#"{"name":"demo"}"#),
+                json_etag: "json-etag".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .load_project_responses("demo")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         cache
             .touch_blob_access("sha256", first_id, 10)
@@ -1732,6 +2454,13 @@ mod tests {
 
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].blob_id, second_id);
+        assert!(
+            cache
+                .load_project_responses("demo")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             cache
                 .load_blob_bytes(&first_relpath)
