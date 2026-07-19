@@ -37,7 +37,7 @@ pub struct AppConfig {
     #[arg(long, default_value_t = 15)]
     pub request_timeout_secs: u64,
 
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 60 * 60)]
     pub stats_interval_secs: u64,
 
     #[arg(long, default_value_t = false)]
@@ -92,5 +92,12 @@ mod tests {
         assert!(parse_size_bytes("").is_err());
         assert!(parse_size_bytes("MiB").is_err());
         assert!(parse_size_bytes("1XB").is_err());
+    }
+
+    #[test]
+    fn defaults_to_hourly_stats_reports() {
+        let config = AppConfig::parse_from(["pytail"]);
+
+        assert_eq!(config.stats_interval_secs, 60 * 60);
     }
 }

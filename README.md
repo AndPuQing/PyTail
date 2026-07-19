@@ -102,6 +102,8 @@ Common options:
   `https://download.pytorch.org/whl/`
 - `--project-cache-ttl-secs`: project page refresh interval, default `900`
 - `--request-timeout-secs`: upstream request timeout, default `15`
+- `--stats-interval-secs`: stats log and trend sampling interval, default `3600`;
+  set to `0` to disable
 - `--verbose`: enable debug logs
 
 ## Build
