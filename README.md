@@ -89,6 +89,23 @@ pip install torch \
   --extra-index-url http://127.0.0.1:3141/simple/
 ```
 
+Flat wheel mirrors, such as the Aliyun PyTorch mirror, can be converted into
+the same project-based Simple API. Start PyTail with the mirror root and enable
+flat-index mode:
+
+```sh
+pytail \
+  --torch-url https://mirrors.aliyun.com/pytorch-wheels/ \
+  --torch-flat-index
+```
+
+Clients continue to use the normal local project index. For example:
+
+```sh
+pip install torch \
+  --index-url http://127.0.0.1:3141/pytorch-wheels/cu128
+```
+
 ## Options
 
 Common options:
@@ -100,6 +117,8 @@ Common options:
 - `--upstream-base-url`: PyPI-compatible upstream, default `https://pypi.org`
 - `--torch-url`: PyTorch wheel upstream, default
   `https://download.pytorch.org/whl/`
+- `--torch-flat-index`: treat each PyTorch channel URL as a flat `--find-links`
+  page and expose it as a project-based Simple API
 - `--project-cache-ttl-secs`: project page refresh interval, default `900`
 - `--request-timeout-secs`: upstream request timeout, default `15`
 - `--stats-interval-secs`: stats log and trend sampling interval, default `3600`;

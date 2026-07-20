@@ -25,6 +25,10 @@ pub struct AppConfig {
     )]
     pub pytorch_wheels_upstream_base_url: String,
 
+    /// Treat each PyTorch channel URL as a flat find-links page.
+    #[arg(long = "torch-flat-index", default_value_t = false)]
+    pub pytorch_wheels_flat_index: bool,
+
     #[arg(long, default_value = ".cache/pytail")]
     pub cache_dir: PathBuf,
 
@@ -99,5 +103,6 @@ mod tests {
         let config = AppConfig::parse_from(["pytail"]);
 
         assert_eq!(config.stats_interval_secs, 60 * 60);
+        assert!(!config.pytorch_wheels_flat_index);
     }
 }

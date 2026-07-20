@@ -1322,47 +1322,81 @@ fn with_db<T>(path: &Path, op: impl FnOnce(&mut Connection) -> io::Result<T>) ->
     })
 }
 
-fn backfill_project_stats(conn: &Connection) -> io::Result<()> {
+fn backfill_project_stats(conn: &Connection) -> io::Result<bool> {
+    let has_missing_stats = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM projects p
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM project_stats ps
+                    WHERE ps.project = p.project
+                )
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sqlite_error)?;
+    if !has_missing_stats {
+        return Ok(false);
+    }
+
     conn.execute_batch(
         "
-        INSERT INTO project_stats (
-            project, file_count, cached_file_count, cached_size_bytes
-        )
-        SELECT
-            p.project,
-            COALESCE(pfc.file_count, 0) AS file_count,
-            COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
-            COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
-        FROM projects p
-        LEFT JOIN (
-            SELECT project, COUNT(position) AS file_count
-            FROM project_links
-            GROUP BY project
-        ) pfc ON pfc.project = p.project
-        LEFT JOIN (
+        WITH missing_projects AS (
+            SELECT p.project
+            FROM projects p
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM project_stats ps
+                WHERE ps.project = p.project
+            )
+        ),
+        project_file_counts AS (
+            SELECT pl.project, COUNT(pl.position) AS file_count
+            FROM project_links pl
+            JOIN missing_projects mp ON mp.project = pl.project
+            GROUP BY pl.project
+        ),
+        ready_project_blobs AS (
+            SELECT
+                pl.project,
+                b.blob_kind,
+                b.blob_id,
+                MAX(b.size_bytes) AS size_bytes
+            FROM project_links pl
+            JOIN missing_projects mp ON mp.project = pl.project
+            JOIN blobs b
+              ON b.blob_kind = pl.blob_kind
+             AND b.blob_id = pl.blob_id
+             AND b.state = 'ready'
+            GROUP BY pl.project, b.blob_kind, b.blob_id
+        ),
+        ready_project_totals AS (
             SELECT
                 project,
                 COUNT(*) AS cached_file_count,
                 COALESCE(SUM(size_bytes), 0) AS cached_size_bytes
-            FROM (
-                SELECT
-                    pl.project,
-                    b.blob_kind,
-                    b.blob_id,
-                    MAX(b.size_bytes) AS size_bytes
-                FROM project_links pl
-                JOIN blobs b
-                  ON b.blob_kind = pl.blob_kind
-                 AND b.blob_id = pl.blob_id
-                 AND b.state = 'ready'
-                GROUP BY pl.project, b.blob_kind, b.blob_id
-            )
+            FROM ready_project_blobs
             GROUP BY project
-        ) rpt ON rpt.project = p.project
+        )
+        INSERT INTO project_stats (
+            project, file_count, cached_file_count, cached_size_bytes
+        )
+        SELECT
+            mp.project,
+            COALESCE(pfc.file_count, 0) AS file_count,
+            COALESCE(rpt.cached_file_count, 0) AS cached_file_count,
+            COALESCE(rpt.cached_size_bytes, 0) AS cached_size_bytes
+        FROM missing_projects mp
+        LEFT JOIN project_file_counts pfc ON pfc.project = mp.project
+        LEFT JOIN ready_project_totals rpt ON rpt.project = mp.project
         ON CONFLICT(project) DO NOTHING;
         ",
     )
-    .map_err(sqlite_error)
+    .map_err(sqlite_error)?;
+    Ok(true)
 }
 
 fn update_project_stats_tx(tx: &rusqlite::Transaction<'_>, project: &str) -> io::Result<()> {
@@ -1889,6 +1923,113 @@ async fn prune_empty_parent_dirs(root: &Path, relpath: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn project_stats_backfill_skips_complete_table() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        init_db(&db_path).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            INSERT INTO projects (
+                project, fetched_at, expires_at, upstream_project_url
+            ) VALUES ('complete', 1, 2, 'https://example/simple/complete/');
+            INSERT INTO project_stats (
+                project, file_count, cached_file_count, cached_size_bytes
+            ) VALUES ('complete', 17, 11, 4096);
+            ",
+        )
+        .unwrap();
+
+        assert!(!backfill_project_stats(&conn).unwrap());
+        let stats = conn
+            .query_row(
+                "SELECT file_count, cached_file_count, cached_size_bytes
+                 FROM project_stats WHERE project = 'complete'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stats, (17, 11, 4096));
+    }
+
+    #[test]
+    fn project_stats_backfill_populates_only_missing_rows() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("index.sqlite3");
+        init_db(&db_path).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            INSERT INTO projects (
+                project, fetched_at, expires_at, upstream_project_url
+            ) VALUES
+                ('complete', 1, 2, 'https://example/simple/complete/'),
+                ('missing', 1, 2, 'https://example/simple/missing/');
+            INSERT INTO project_stats (
+                project, file_count, cached_file_count, cached_size_bytes
+            ) VALUES ('complete', 17, 11, 4096);
+            INSERT INTO blobs (
+                blob_kind, blob_id, storage_relpath, content_type, fetched_at,
+                last_accessed_at, size_bytes, filename, upstream_url, state
+            ) VALUES
+                ('sha256', 'ready', 'ready.whl', 'application/octet-stream',
+                 1, 1, 5, 'ready.whl', 'https://files.example/ready.whl', 'ready'),
+                ('sha256', 'pending', 'pending.whl', 'application/octet-stream',
+                 1, 1, 7, 'pending.whl', 'https://files.example/pending.whl', 'pending');
+            INSERT INTO project_links (
+                project, position, filename, upstream_url, blob_kind, blob_id
+            ) VALUES
+                ('missing', 0, 'ready.whl', 'https://files.example/ready.whl',
+                 'sha256', 'ready'),
+                ('missing', 1, 'ready-again.whl', 'https://files.example/ready.whl',
+                 'sha256', 'ready'),
+                ('missing', 2, 'pending.whl', 'https://files.example/pending.whl',
+                 'sha256', 'pending');
+            ",
+        )
+        .unwrap();
+
+        assert!(backfill_project_stats(&conn).unwrap());
+        assert!(!backfill_project_stats(&conn).unwrap());
+        let missing_stats = conn
+            .query_row(
+                "SELECT file_count, cached_file_count, cached_size_bytes
+                 FROM project_stats WHERE project = 'missing'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(missing_stats, (3, 1, 5));
+        let complete_stats = conn
+            .query_row(
+                "SELECT file_count, cached_file_count, cached_size_bytes
+                 FROM project_stats WHERE project = 'complete'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(complete_stats, (17, 11, 4096));
+    }
 
     #[tokio::test]
     async fn stores_and_loads_project_from_sqlite() {

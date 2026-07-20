@@ -1,10 +1,15 @@
-use crate::simple::normalize_project_name;
+use crate::simple::{
+    ParsedLink, group_flat_wheel_links, normalize_project_name, parse_project_links,
+};
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{ACCEPT, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE};
 use reqwest::{Response as ReqwestResponse, StatusCode};
+use std::collections::BTreeMap;
 use std::io;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
@@ -20,7 +25,21 @@ pub struct UpstreamClient {
     base_url: Url,
     base_is_simple_root: bool,
     forbidden_is_not_found: bool,
+    flat_index: Option<FlatIndex>,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Clone)]
+struct FlatIndex {
+    cache_ttl: Duration,
+    cached_page: Arc<Mutex<Option<CachedFlatPage>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFlatPage {
+    page: FetchedProjectPage,
+    projects: BTreeMap<String, Vec<ParsedLink>>,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +49,7 @@ pub struct FetchedProjectPage {
     pub format: ProjectPageFormat,
     pub etag: Option<String>,
     pub serial: Option<u64>,
+    pub parsed_links: Option<Vec<ParsedLink>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +91,7 @@ impl UpstreamClient {
             base_url,
             base_is_simple_root,
             forbidden_is_not_found: false,
+            flat_index: None,
             client,
         })
     }
@@ -82,12 +103,32 @@ impl UpstreamClient {
         Ok(client)
     }
 
+    pub fn new_flat_root(
+        base_url: &str,
+        timeout_secs: u64,
+        cache_ttl_secs: u64,
+    ) -> io::Result<Self> {
+        let mut client = Self::new_project_root(base_url, timeout_secs)?;
+        client.flat_index = Some(FlatIndex {
+            cache_ttl: Duration::from_secs(cache_ttl_secs),
+            cached_page: Arc::new(Mutex::new(None)),
+        });
+        Ok(client)
+    }
+
     pub fn child_project_root(&self, path: &str, timeout_secs: u64) -> io::Result<Self> {
         let base_url = self
             .base_url
             .join(&format!("{}/", path.trim_matches('/')))
             .map_err(invalid_input)?;
-        Self::new_project_root(base_url.as_str(), timeout_secs)
+        match &self.flat_index {
+            Some(flat_index) => Self::new_flat_root(
+                base_url.as_str(),
+                timeout_secs,
+                flat_index.cache_ttl.as_secs(),
+            ),
+            None => Self::new_project_root(base_url.as_str(), timeout_secs),
+        }
     }
 
     pub async fn fetch_project(
@@ -95,7 +136,69 @@ impl UpstreamClient {
         project: &str,
         etag: Option<&str>,
     ) -> io::Result<ProjectFetch> {
+        if self.flat_index.is_some() {
+            return self.fetch_flat_project(project, etag).await;
+        }
         let url = self.project_url(project)?;
+        self.fetch_project_url(url, etag).await
+    }
+
+    async fn fetch_flat_project(
+        &self,
+        project: &str,
+        etag: Option<&str>,
+    ) -> io::Result<ProjectFetch> {
+        let flat_index = self.flat_index.as_ref().expect("flat index configured");
+        let mut cached_page = flat_index.cached_page.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = cached_page.as_ref()
+            && now < cached.expires_at
+        {
+            return Ok(cached.fetch_for(project, etag));
+        }
+
+        let revalidation_etag = cached_page
+            .as_ref()
+            .and_then(|cached| cached.page.etag.clone())
+            .or_else(|| etag.map(ToOwned::to_owned));
+        let result = self
+            .fetch_project_url(self.base_url.clone(), revalidation_etag.as_deref())
+            .await?;
+        match result {
+            ProjectFetch::Fresh(page) => {
+                let page_url = Url::parse(&page.project_url).map_err(invalid_input)?;
+                let projects = group_flat_wheel_links(parse_project_links(&page.body, &page_url));
+                if projects.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "flat upstream page did not contain any wheel links",
+                    ));
+                }
+                let fresh = CachedFlatPage {
+                    page,
+                    projects,
+                    expires_at: flat_cache_expiry(now, flat_index.cache_ttl),
+                };
+                let result = fresh.fetch_for(project, etag);
+                *cached_page = Some(fresh);
+                Ok(result)
+            }
+            ProjectFetch::NotModified => {
+                if let Some(cached) = cached_page.as_mut() {
+                    cached.expires_at = flat_cache_expiry(now, flat_index.cache_ttl);
+                    Ok(cached.fetch_for(project, etag))
+                } else {
+                    Ok(ProjectFetch::NotModified)
+                }
+            }
+            ProjectFetch::NotFound => {
+                *cached_page = None;
+                Ok(ProjectFetch::NotFound)
+            }
+        }
+    }
+
+    async fn fetch_project_url(&self, url: Url, etag: Option<&str>) -> io::Result<ProjectFetch> {
         let mut request = self.client.get(url.clone()).header(ACCEPT, SIMPLE_ACCEPT);
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
@@ -129,6 +232,7 @@ impl UpstreamClient {
                     format,
                     etag,
                     serial,
+                    parsed_links: None,
                 }))
             }
             StatusCode::NOT_MODIFIED => Ok(ProjectFetch::NotModified),
@@ -219,6 +323,9 @@ impl UpstreamClient {
     }
 
     pub(crate) fn project_url(&self, project: &str) -> io::Result<Url> {
+        if self.flat_index.is_some() {
+            return Ok(self.base_url.clone());
+        }
         let path = if self.base_is_simple_root {
             format!("{}/", normalize_project_name(project))
         } else {
@@ -226,6 +333,26 @@ impl UpstreamClient {
         };
         self.base_url.join(&path).map_err(invalid_input)
     }
+}
+
+impl CachedFlatPage {
+    fn fetch_for(&self, project: &str, etag: Option<&str>) -> ProjectFetch {
+        let project = normalize_project_name(project);
+        let Some(links) = self.projects.get(&project) else {
+            return ProjectFetch::NotFound;
+        };
+        if etag.is_some() && etag == self.page.etag.as_deref() {
+            ProjectFetch::NotModified
+        } else {
+            let mut page = self.page.clone();
+            page.parsed_links = Some(links.clone());
+            ProjectFetch::Fresh(page)
+        }
+    }
+}
+
+fn flat_cache_expiry(now: Instant, cache_ttl: Duration) -> Instant {
+    now.checked_add(cache_ttl).unwrap_or(now)
 }
 
 fn project_page_format(content_type: &str) -> ProjectPageFormat {
@@ -353,6 +480,17 @@ mod tests {
         assert_eq!(
             client.project_url("Torch").unwrap().as_str(),
             "https://download.pytorch.org/whl/cu126/torch/"
+        );
+    }
+
+    #[test]
+    fn flat_root_uses_the_channel_page_for_every_project() {
+        let client =
+            UpstreamClient::new_flat_root("https://mirrors.example/pytorch-wheels/cu128", 5, 900)
+                .unwrap();
+        assert_eq!(
+            client.project_url("Torch").unwrap().as_str(),
+            "https://mirrors.example/pytorch-wheels/cu128/"
         );
     }
 

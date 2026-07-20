@@ -31,6 +31,7 @@ async fn disk_cache_limit_evicts_least_recently_used_file() -> Result<(), Box<dy
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),
             pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
+            pytorch_wheels_flat_index: false,
             cache_dir: cache_dir.clone(),
             cache_max_size: 12,
             project_cache_ttl_secs: 3600,

@@ -40,6 +40,7 @@ async fn pip_installs_package_through_local_simple_api() -> Result<(), Box<dyn E
             bind: proxy_addr.to_string(),
             upstream_base_url: upstream.base_url.clone(),
             pytorch_wheels_upstream_base_url: upstream.base_url.clone(),
+            pytorch_wheels_flat_index: false,
             cache_dir,
             cache_max_size: 0,
             project_cache_ttl_secs: 3600,

@@ -242,6 +242,7 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
         bind = %local_addr,
         upstream = %config.upstream_base_url,
         pytorch_wheels_upstream = %config.pytorch_wheels_upstream_base_url,
+        pytorch_wheels_flat_index = config.pytorch_wheels_flat_index,
         cache_dir = %config.cache_dir.display(),
         cache_max_size = config.cache_max_size,
         project_cache_ttl_secs = config.project_cache_ttl_secs,
@@ -251,13 +252,22 @@ pub async fn serve_listener(config: AppConfig, listener: TcpListener) -> io::Res
     );
     let cache = CacheStore::new(config.cache_dir.clone());
     cache.initialize().await?;
+    let pytorch_wheels_upstream = if config.pytorch_wheels_flat_index {
+        UpstreamClient::new_flat_root(
+            &config.pytorch_wheels_upstream_base_url,
+            config.request_timeout_secs,
+            config.project_cache_ttl_secs,
+        )?
+    } else {
+        UpstreamClient::new_project_root(
+            &config.pytorch_wheels_upstream_base_url,
+            config.request_timeout_secs,
+        )?
+    };
     let state = AppState {
         cache,
         upstream: UpstreamClient::new(&config.upstream_base_url, config.request_timeout_secs)?,
-        pytorch_wheels_upstream: UpstreamClient::new_project_root(
-            &config.pytorch_wheels_upstream_base_url,
-            config.request_timeout_secs,
-        )?,
+        pytorch_wheels_upstream,
         pytorch_channel_upstreams: Arc::new(DashMap::new()),
         request_timeout_secs: config.request_timeout_secs,
         project_cache_ttl_secs: config.project_cache_ttl_secs,
@@ -1123,11 +1133,11 @@ async fn refresh_project_cache(
                 info!(project, "fetched fresh project page from upstream");
                 let page_url =
                     Url::parse(&page.project_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
-                let parsed_links = match page.format {
+                let parsed_links = page.parsed_links.unwrap_or_else(|| match page.format {
                     ProjectPageFormat::Json => parse_project_json_links(&page.body, &page_url)
                         .unwrap_or_else(|_| parse_project_links(&page.body, &page_url)),
                     ProjectPageFormat::Html => parse_project_links(&page.body, &page_url),
-                };
+                });
                 let links = parsed_links
                     .into_iter()
                     .map(|link| {

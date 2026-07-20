@@ -146,6 +146,27 @@ pub fn parse_project_json_links(body: &str, page_url: &Url) -> Result<Vec<Parsed
     Ok(links)
 }
 
+pub fn group_flat_wheel_links(links: Vec<ParsedLink>) -> BTreeMap<String, Vec<ParsedLink>> {
+    let mut projects = BTreeMap::<String, Vec<ParsedLink>>::new();
+    for link in links {
+        let Some(distribution) = wheel_distribution(&link.filename) else {
+            continue;
+        };
+        projects
+            .entry(normalize_project_name(distribution))
+            .or_default()
+            .push(link);
+    }
+    projects
+}
+
+fn wheel_distribution(filename: &str) -> Option<&str> {
+    let filename = filename.strip_suffix(".whl")?;
+    filename
+        .split_once('-')
+        .map(|(distribution, _)| distribution)
+}
+
 #[derive(Debug, Deserialize)]
 struct SimpleProjectJson {
     #[serde(default)]
@@ -805,6 +826,27 @@ mod tests {
             links[0].dist_info_metadata.as_deref(),
             Some("sha256=metaabcd")
         );
+    }
+
+    #[test]
+    fn groups_flat_wheel_page_by_normalized_distribution() {
+        let page_url = Url::parse("https://mirror.example/cu128/").unwrap();
+        let body = r#"
+            <a href="torch-2.11.0%2Bcu128-cp313-cp313-linux_x86_64.whl">torch-2.11.0+cu128-cp313-cp313-linux_x86_64.whl</a>
+            <a href="torchvision-0.26.0%2Bcu128-cp313-cp313-linux_x86_64.whl">torchvision-0.26.0+cu128-cp313-cp313-linux_x86_64.whl</a>
+            <a href="my_pkg-1.0-py3-none-any.whl">my_pkg-1.0-py3-none-any.whl</a>
+            <a href="/assets/site.css">site.css</a>
+        "#;
+        let projects = group_flat_wheel_links(parse_project_links(body, &page_url));
+
+        let torch = &projects["torch"];
+        assert_eq!(torch.len(), 1);
+        assert_eq!(
+            torch[0].filename,
+            "torch-2.11.0+cu128-cp313-cp313-linux_x86_64.whl"
+        );
+        assert_eq!(projects["my-pkg"].len(), 1);
+        assert!(!projects.contains_key("missing"));
     }
 
     #[test]
