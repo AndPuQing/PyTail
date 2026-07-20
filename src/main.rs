@@ -14,7 +14,11 @@ async fn main() {
 }
 
 fn init_logging(verbose: bool) {
-    let default_filter = if verbose { "pytail=debug" } else { "warn" };
+    let default_filter = if verbose {
+        "pytail=debug"
+    } else {
+        "pytail=info"
+    };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt()

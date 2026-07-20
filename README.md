@@ -123,7 +123,8 @@ Common options:
 - `--request-timeout-secs`: upstream request timeout, default `15`
 - `--stats-interval-secs`: stats log and trend sampling interval, default `3600`;
   set to `0` to disable
-- `--verbose`: enable debug logs
+- `--verbose`: enable operational debug logs; use `RUST_LOG=pytail=trace` for
+  per-request and cache-hit details
 
 ## Build
 

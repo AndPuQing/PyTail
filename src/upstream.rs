@@ -10,7 +10,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 const SIMPLE_ACCEPT: &str = concat!(
@@ -203,9 +203,10 @@ impl UpstreamClient {
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
-        debug!(%url, has_etag = etag.is_some(), "fetching upstream project page");
+        let endpoint = upstream_label(&url);
+        trace!(%endpoint, revalidate = etag.is_some(), "fetching upstream project");
         let response = request.send().await.map_err(io_other)?;
-        debug!(%url, status = %response.status(), "upstream project page response");
+        trace!(%endpoint, status = %response.status(), "upstream project response");
         match response.status() {
             StatusCode::OK => {
                 let etag = response
@@ -250,13 +251,14 @@ impl UpstreamClient {
 
     pub async fn open_file_range(&self, url: &str, start: Option<u64>) -> io::Result<UpstreamFile> {
         let url = Url::parse(url).map_err(invalid_input)?;
-        debug!(%url, ?start, "opening upstream file");
+        let endpoint = upstream_label(&url);
+        trace!(%endpoint, ?start, "opening upstream file");
         let mut request = self.client.get(url);
         if let Some(start) = start {
             request = request.header(RANGE, format!("bytes={start}-"));
         }
         let response = request.send().await.map_err(io_other)?;
-        debug!(url = %response.url(), status = %response.status(), "upstream file response");
+        trace!(%endpoint, status = %response.status(), "upstream file response");
         if response.status() == StatusCode::NOT_FOUND {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -283,7 +285,8 @@ impl UpstreamClient {
 
     pub async fn fetch_file_range(&self, url: &str, range: &str) -> io::Result<UpstreamRangeFetch> {
         let url = Url::parse(url).map_err(invalid_input)?;
-        debug!(%url, range, "opening upstream file range");
+        let endpoint = upstream_label(&url);
+        trace!(%endpoint, range, "opening upstream file range");
         let response = self
             .client
             .get(url)
@@ -291,7 +294,7 @@ impl UpstreamClient {
             .send()
             .await
             .map_err(io_other)?;
-        debug!(url = %response.url(), status = %response.status(), "upstream file range response");
+        trace!(%endpoint, status = %response.status(), "upstream file range response");
         match response.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let file = upstream_file(response);
@@ -440,6 +443,19 @@ fn upstream_file(response: ReqwestResponse) -> UpstreamFile {
     }
 }
 
+fn upstream_label(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("unknown");
+    let path = url.path().trim_end_matches('/');
+    match path
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+    {
+        Some(segment) => format!("{host}/{segment}"),
+        None => host.to_string(),
+    }
+}
+
 fn invalid_input(err: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
 }
@@ -491,6 +507,17 @@ mod tests {
         assert_eq!(
             client.project_url("Torch").unwrap().as_str(),
             "https://mirrors.example/pytorch-wheels/cu128/"
+        );
+    }
+
+    #[test]
+    fn log_labels_omit_long_upstream_paths() {
+        let url =
+            Url::parse("https://mirror.example/packages/aa/bb/hash/demo-1.0-py3-none-any.whl")
+                .unwrap();
+        assert_eq!(
+            upstream_label(&url),
+            "mirror.example/demo-1.0-py3-none-any.whl"
         );
     }
 
