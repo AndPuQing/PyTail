@@ -1,5 +1,6 @@
 use crate::simple::{
     ParsedLink, group_flat_wheel_links, normalize_project_name, parse_project_links,
+    parse_root_html_projects, parse_root_json_projects,
 };
 use bytes::Bytes;
 use futures_util::Stream;
@@ -143,6 +144,64 @@ impl UpstreamClient {
         self.fetch_project_url(url, etag).await
     }
 
+    pub async fn fetch_project_index(&self) -> io::Result<Option<Vec<String>>> {
+        if let Some(flat_index) = &self.flat_index {
+            let mut cached_page = flat_index.cached_page.lock().await;
+            let now = Instant::now();
+            if let Some(cached) = cached_page.as_ref()
+                && now < cached.expires_at
+            {
+                return Ok(Some(cached.projects.keys().cloned().collect()));
+            }
+
+            let revalidation_etag = cached_page
+                .as_ref()
+                .and_then(|cached| cached.page.etag.clone());
+            let result = self
+                .fetch_project_url(self.base_url.clone(), revalidation_etag.as_deref())
+                .await?;
+            return match result {
+                ProjectFetch::Fresh(page) => {
+                    let fresh = cached_flat_page(page, now, flat_index.cache_ttl)?;
+                    let projects = fresh.projects.keys().cloned().collect();
+                    *cached_page = Some(fresh);
+                    Ok(Some(projects))
+                }
+                ProjectFetch::NotModified => {
+                    let Some(cached) = cached_page.as_mut() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "flat upstream returned not modified without a cached index",
+                        ));
+                    };
+                    cached.expires_at = flat_cache_expiry(now, flat_index.cache_ttl);
+                    Ok(Some(cached.projects.keys().cloned().collect()))
+                }
+                ProjectFetch::NotFound => {
+                    *cached_page = None;
+                    Ok(None)
+                }
+            };
+        }
+
+        match self.fetch_project_url(self.base_url.clone(), None).await? {
+            ProjectFetch::Fresh(page) => {
+                let page_url = Url::parse(&page.project_url).map_err(invalid_input)?;
+                let projects = match page.format {
+                    ProjectPageFormat::Json => parse_root_json_projects(&page.body)
+                        .unwrap_or_else(|_| parse_root_html_projects(&page.body, &page_url)),
+                    ProjectPageFormat::Html => parse_root_html_projects(&page.body, &page_url),
+                };
+                Ok(Some(projects))
+            }
+            ProjectFetch::NotFound => Ok(None),
+            ProjectFetch::NotModified => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream returned not modified for an unconditional index request",
+            )),
+        }
+    }
+
     async fn fetch_flat_project(
         &self,
         project: &str,
@@ -166,19 +225,7 @@ impl UpstreamClient {
             .await?;
         match result {
             ProjectFetch::Fresh(page) => {
-                let page_url = Url::parse(&page.project_url).map_err(invalid_input)?;
-                let projects = group_flat_wheel_links(parse_project_links(&page.body, &page_url));
-                if projects.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "flat upstream page did not contain any wheel links",
-                    ));
-                }
-                let fresh = CachedFlatPage {
-                    page,
-                    projects,
-                    expires_at: flat_cache_expiry(now, flat_index.cache_ttl),
-                };
+                let fresh = cached_flat_page(page, now, flat_index.cache_ttl)?;
                 let result = fresh.fetch_for(project, etag);
                 *cached_page = Some(fresh);
                 Ok(result)
@@ -338,6 +385,26 @@ impl UpstreamClient {
     }
 }
 
+fn cached_flat_page(
+    page: FetchedProjectPage,
+    now: Instant,
+    cache_ttl: Duration,
+) -> io::Result<CachedFlatPage> {
+    let page_url = Url::parse(&page.project_url).map_err(invalid_input)?;
+    let projects = group_flat_wheel_links(parse_project_links(&page.body, &page_url));
+    if projects.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "flat upstream page did not contain any wheel links",
+        ));
+    }
+    Ok(CachedFlatPage {
+        page,
+        projects,
+        expires_at: flat_cache_expiry(now, cache_ttl),
+    })
+}
+
 impl CachedFlatPage {
     fn fetch_for(&self, project: &str, etag: Option<&str>) -> ProjectFetch {
         let project = normalize_project_name(project);
@@ -468,6 +535,7 @@ fn io_other(err: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use axum::Router;
+    use axum::response::Html;
     use axum::routing::get;
     use tokio::net::TcpListener;
 
@@ -510,6 +578,17 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn project_root_lists_projects_from_the_upstream_index() {
+        let base_url = spawn_project_index_upstream().await;
+        let client = UpstreamClient::new_project_root(&base_url, 5).unwrap();
+
+        assert_eq!(
+            client.fetch_project_index().await.unwrap(),
+            Some(vec!["torch".to_string(), "torchvision".to_string()])
+        );
+    }
+
     #[test]
     fn log_labels_omit_long_upstream_paths() {
         let url =
@@ -546,6 +625,25 @@ mod tests {
 
     async fn spawn_forbidden_upstream() -> String {
         let app = Router::new().fallback(get(|| async { StatusCode::FORBIDDEN }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn spawn_project_index_upstream() -> String {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Html(
+                    r#"<a href="torch/">Torch</a>
+                       <a href="torchvision/">torchvision</a>
+                       <a href="torch-2.0.whl">torch-2.0.whl</a>"#,
+                )
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

@@ -40,6 +40,20 @@ async fn flat_torch_index_becomes_project_simple_api() -> Result<(), Box<dyn Err
     ));
     let client = reqwest::Client::builder().no_proxy().build()?;
 
+    let root = fetch_index(&client, proxy_addr, "/pytorch-wheels/").await?;
+    assert_eq!(project_names(&root), vec!["torch", "torchvision"]);
+    assert_eq!(root["projects"][0]["url"], "/pytorch-wheels/torch/");
+
+    let direct_torch = fetch_json(&client, proxy_addr, "/pytorch-wheels/torch/").await?;
+    assert_eq!(filenames(&direct_torch), vec![TORCH_WHEEL]);
+
+    let channel = fetch_index(&client, proxy_addr, "/pytorch-wheels/cu128/").await?;
+    assert_eq!(project_names(&channel), vec!["torch", "torchvision"]);
+    assert_eq!(
+        channel["projects"][0]["url"],
+        "/pytorch-wheels/cu128/torch/"
+    );
+
     let torch = fetch_project(&client, proxy_addr, "torch").await?;
     assert_eq!(filenames(&torch), vec![TORCH_WHEEL]);
 
@@ -54,9 +68,14 @@ async fn flat_torch_index_becomes_project_simple_api() -> Result<(), Box<dyn Err
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        upstream.state.index_requests.load(Ordering::SeqCst),
+        upstream.state.root_index_requests.load(Ordering::SeqCst),
         1,
-        "the flat channel page should be shared by all project lookups"
+        "the flat root page should be shared by root and direct project lookups"
+    );
+    assert_eq!(
+        upstream.state.channel_index_requests.load(Ordering::SeqCst),
+        1,
+        "the flat channel page should be shared by its root and project lookups"
     );
 
     let file_url = torch["files"][0]["url"].as_str().unwrap();
@@ -72,20 +91,48 @@ async fn flat_torch_index_becomes_project_simple_api() -> Result<(), Box<dyn Err
     Ok(())
 }
 
-async fn fetch_project(
+async fn fetch_index(
     client: &reqwest::Client,
     proxy_addr: std::net::SocketAddr,
-    project: &str,
+    path: &str,
+) -> Result<Value, Box<dyn Error>> {
+    fetch_json(client, proxy_addr, path).await
+}
+
+async fn fetch_json(
+    client: &reqwest::Client,
+    proxy_addr: std::net::SocketAddr,
+    path: &str,
 ) -> Result<Value, Box<dyn Error>> {
     let response = client
-        .get(format!(
-            "http://{proxy_addr}/pytorch-wheels/cu128/{project}/"
-        ))
+        .get(format!("http://{proxy_addr}{path}"))
         .header(ACCEPT, "application/vnd.pypi.simple.v1+json")
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     Ok(serde_json::from_str(&response.text().await?)?)
+}
+
+async fn fetch_project(
+    client: &reqwest::Client,
+    proxy_addr: std::net::SocketAddr,
+    project: &str,
+) -> Result<Value, Box<dyn Error>> {
+    fetch_json(
+        client,
+        proxy_addr,
+        &format!("/pytorch-wheels/cu128/{project}/"),
+    )
+    .await
+}
+
+fn project_names(index: &Value) -> Vec<&str> {
+    index["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| project["name"].as_str().unwrap())
+        .collect()
 }
 
 fn filenames(project: &Value) -> Vec<&str> {
@@ -105,7 +152,8 @@ struct FlatUpstream {
 struct FlatUpstreamState {
     wheel: Bytes,
     sha256: String,
-    index_requests: AtomicUsize,
+    root_index_requests: AtomicUsize,
+    channel_index_requests: AtomicUsize,
     file_requests: AtomicUsize,
 }
 
@@ -114,12 +162,15 @@ async fn spawn_flat_upstream() -> Result<FlatUpstream, Box<dyn Error>> {
     let state = Arc::new(FlatUpstreamState {
         sha256: format!("{:x}", Sha256::digest(&wheel)),
         wheel,
-        index_requests: AtomicUsize::new(0),
+        root_index_requests: AtomicUsize::new(0),
+        channel_index_requests: AtomicUsize::new(0),
         file_requests: AtomicUsize::new(0),
     });
     let app = Router::new()
-        .route("/cu128/", get(flat_index))
+        .route("/", get(flat_root_index))
+        .route("/cu128/", get(flat_channel_index))
         .route("/cu128/{filename}", get(flat_file))
+        .route("/{filename}", get(flat_file))
         .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -132,8 +183,17 @@ async fn spawn_flat_upstream() -> Result<FlatUpstream, Box<dyn Error>> {
     })
 }
 
-async fn flat_index(State(state): State<Arc<FlatUpstreamState>>) -> String {
-    state.index_requests.fetch_add(1, Ordering::SeqCst);
+async fn flat_root_index(State(state): State<Arc<FlatUpstreamState>>) -> String {
+    state.root_index_requests.fetch_add(1, Ordering::SeqCst);
+    flat_index_body(&state)
+}
+
+async fn flat_channel_index(State(state): State<Arc<FlatUpstreamState>>) -> String {
+    state.channel_index_requests.fetch_add(1, Ordering::SeqCst);
+    flat_index_body(&state)
+}
+
+fn flat_index_body(state: &FlatUpstreamState) -> String {
     format!(
         r#"<html><body>
         <a href="{TORCH_WHEEL}#sha256={hash}">{TORCH_WHEEL}</a>

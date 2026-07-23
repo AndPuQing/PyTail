@@ -2,7 +2,7 @@ use crate::cache::{CachedLink, ProjectSummary, RootHistorySample};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 const SIMPLE_JSON_MEDIA_TYPE: &str = "application/vnd.pypi.simple.v1+json";
@@ -146,6 +146,52 @@ pub fn parse_project_json_links(body: &str, page_url: &Url) -> Result<Vec<Parsed
     Ok(links)
 }
 
+pub fn parse_root_html_projects(body: &str, page_url: &Url) -> Vec<String> {
+    let document = Html::parse_document(body);
+    let selector = Selector::parse("a").expect("valid selector");
+    let mut base_path = page_url.path().trim_end_matches('/').to_string();
+    base_path.push('/');
+    let mut projects = BTreeSet::new();
+    for element in document.select(&selector) {
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Ok(resolved) = page_url.join(href) else {
+            continue;
+        };
+        if resolved.scheme() != page_url.scheme()
+            || resolved.host_str() != page_url.host_str()
+            || resolved.port_or_known_default() != page_url.port_or_known_default()
+            || !resolved.path().ends_with('/')
+            || !resolved.path().starts_with(&base_path)
+        {
+            continue;
+        }
+        let relative = resolved.path()[base_path.len()..].trim_end_matches('/');
+        if relative.is_empty() || relative.contains('/') {
+            continue;
+        }
+        let label = element.text().collect::<String>();
+        let project = normalize_project_name(label.trim());
+        if !project.is_empty() {
+            projects.insert(project);
+        }
+    }
+    projects.into_iter().collect()
+}
+
+pub fn parse_root_json_projects(body: &str) -> Result<Vec<String>, String> {
+    let page: SimpleRootJson = serde_json::from_str(body).map_err(|err| err.to_string())?;
+    Ok(page
+        .projects
+        .into_iter()
+        .map(|project| normalize_project_name(&project.name))
+        .filter(|project| !project.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
 pub fn group_flat_wheel_links(links: Vec<ParsedLink>) -> BTreeMap<String, Vec<ParsedLink>> {
     let mut projects = BTreeMap::<String, Vec<ParsedLink>>::new();
     for link in links {
@@ -165,6 +211,17 @@ fn wheel_distribution(filename: &str) -> Option<&str> {
     filename
         .split_once('-')
         .map(|(distribution, _)| distribution)
+}
+
+#[derive(Debug, Deserialize)]
+struct SimpleRootJson {
+    #[serde(default)]
+    projects: Vec<SimpleRootProject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimpleRootProject {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,12 +475,17 @@ fn format_hit_rate(hits: u64, misses: u64) -> String {
 }
 
 pub fn render_root_json(projects: &[String]) -> String {
+    render_root_json_with_base(projects, "/simple/")
+}
+
+pub fn render_root_json_with_base(projects: &[String], base_path: &str) -> String {
+    let base_path = format!("{}/", base_path.trim_end_matches('/'));
     let projects = projects
         .iter()
         .map(|project| {
             json!({
                 "name": project,
-                "url": format!("/simple/{project}/"),
+                "url": format!("{base_path}{project}/"),
             })
         })
         .collect::<Vec<_>>();
@@ -432,6 +494,49 @@ pub fn render_root_json(projects: &[String]) -> String {
         "projects": projects,
     })
     .to_string()
+}
+
+pub fn render_repository_root_html(
+    repository: &str,
+    base_path: &str,
+    projects: &[String],
+) -> String {
+    let base_path = format!("{}/", base_path.trim_end_matches('/'));
+    let mut html = String::from(
+        "<!DOCTYPE html>\n<html>\n  <head>\n    <meta name=\"pypi:repository-version\" content=\"1.0\">\n    <title>",
+    );
+    html.push_str(&escape_html(repository));
+    html.push_str(" - pytail</title>\n");
+    push_ui_head(&mut html);
+    html.push_str("  </head>\n  <body>\n    <div class=\"page-shell\">\n");
+
+    let mut breadcrumbs = vec![("root", "/simple/"), ("pytorch-wheels", "/pytorch-wheels/")];
+    if let Some(channel) = repository.strip_prefix("pytorch-wheels/") {
+        breadcrumbs.push((channel, base_path.as_str()));
+    }
+    push_header_with_search_action(&mut html, &base_path, &breadcrumbs);
+    html.push_str(
+        "      <main id=\"content\" class=\"content\">\n        <h1 class=\"page-title\">",
+    );
+    html.push_str(&escape_html(repository));
+    html.push_str("</h1>\n        <p class=\"subtitle\">PyTorch wheel index</p>\n");
+    if projects.is_empty() {
+        html.push_str("        <div class=\"empty-state\">No projects available.</div>\n");
+    } else {
+        html.push_str("        <div class=\"project-grid\">\n");
+        for project in projects {
+            html.push_str("          <a class=\"project-link\" href=\"");
+            html.push_str(&escape_html_attr(&format!("{base_path}{project}/")));
+            html.push_str("\">");
+            html.push_str(&escape_html(project));
+            html.push_str("</a>\n");
+        }
+        html.push_str("        </div>\n");
+    }
+    html.push_str("      </main>\n");
+    push_footer(&mut html);
+    html.push_str("    </div>\n  </body>\n</html>\n");
+    html
 }
 
 pub fn render_project_html(project: &str, links: &[CachedLink]) -> String {
@@ -706,7 +811,17 @@ fn push_ui_head(html: &mut String) {
 }
 
 fn push_header(html: &mut String, breadcrumbs: &[(&str, &str)]) {
-    html.push_str("      <header class=\"topbar\">\n        <div class=\"search-row\">\n          <a class=\"brand\" href=\"/simple/\">pytail</a>\n          <form id=\"search\" class=\"search-form\" action=\"/simple/\" method=\"get\">\n            <input class=\"search-input\" type=\"text\" name=\"q\" placeholder=\"package name\" autocomplete=\"off\">\n            <input class=\"search-button\" type=\"submit\" value=\"Search\">\n          </form>\n        </div>\n        <nav class=\"breadcrumbs\">\n");
+    push_header_with_search_action(html, "/simple/", breadcrumbs);
+}
+
+fn push_header_with_search_action(
+    html: &mut String,
+    search_action: &str,
+    breadcrumbs: &[(&str, &str)],
+) {
+    html.push_str("      <header class=\"topbar\">\n        <div class=\"search-row\">\n          <a class=\"brand\" href=\"/simple/\">pytail</a>\n          <form id=\"search\" class=\"search-form\" action=\"");
+    html.push_str(&escape_html_attr(search_action));
+    html.push_str("\" method=\"get\">\n            <input class=\"search-input\" type=\"text\" name=\"q\" placeholder=\"package name\" autocomplete=\"off\">\n            <input class=\"search-button\" type=\"submit\" value=\"Search\">\n          </form>\n        </div>\n        <nav class=\"breadcrumbs\">\n");
     for (label, href) in breadcrumbs {
         html.push_str("          <a href=\"");
         html.push_str(&escape_html_attr(href));
@@ -847,6 +962,58 @@ mod tests {
         );
         assert_eq!(projects["my-pkg"].len(), 1);
         assert!(!projects.contains_key("missing"));
+    }
+
+    #[test]
+    fn parses_simple_root_projects_without_parent_or_nested_links() {
+        let page_url = Url::parse("https://download.example/whl/cu128/").unwrap();
+        let body = r#"
+            <a href="../">parent</a>
+            <a href="Torch/">Torch</a>
+            <a href="torchvision/">torchvision</a>
+            <a href="nested/project/">nested</a>
+            <a href="torch-2.0.whl">torch-2.0.whl</a>
+            <a href="https://other.example/project/">external</a>
+        "#;
+
+        assert_eq!(
+            parse_root_html_projects(body, &page_url),
+            vec!["torch".to_string(), "torchvision".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_json_simple_root_projects() {
+        let body = r#"{
+            "meta": {"api-version": "1.0"},
+            "projects": [
+                {"name": "Torch", "url": "torch/"},
+                {"name": "torch_vision", "url": "torch-vision/"},
+                {"name": "Torch", "url": "duplicate/"}
+            ]
+        }"#;
+
+        assert_eq!(
+            parse_root_json_projects(body).unwrap(),
+            vec!["torch".to_string(), "torch-vision".to_string()]
+        );
+    }
+
+    #[test]
+    fn renders_repository_root_with_local_project_urls() {
+        let projects = vec!["torch".to_string(), "torchvision".to_string()];
+
+        let json = render_root_json_with_base(&projects, "/pytorch-wheels/cu128/");
+        assert!(json.contains("\"url\":\"/pytorch-wheels/cu128/torch/\""));
+
+        let html = render_repository_root_html(
+            "pytorch-wheels/cu128",
+            "/pytorch-wheels/cu128/",
+            &projects,
+        );
+        assert!(html.contains("<h1 class=\"page-title\">pytorch-wheels/cu128</h1>"));
+        assert!(html.contains("action=\"/pytorch-wheels/cu128/\""));
+        assert!(html.contains("href=\"/pytorch-wheels/cu128/torch/\""));
     }
 
     #[test]

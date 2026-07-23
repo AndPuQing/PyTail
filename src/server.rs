@@ -8,7 +8,8 @@ use crate::range::parse_byte_range;
 use crate::simple::{
     RootStats, json_media_type, normalize_project_name, parse_project_json_links,
     parse_project_links, render_project_html_with_file_base, render_project_json_with_file_base,
-    render_root_html, render_root_json, wants_json,
+    render_repository_root_html, render_root_html, render_root_json, render_root_json_with_base,
+    wants_json,
 };
 use crate::upstream::{ProjectFetch, ProjectPageFormat, UpstreamClient, UpstreamRangeFetch};
 use axum::Router;
@@ -471,8 +472,16 @@ fn app(state: AppState) -> Router {
         .route("/simple/", get(simple_root))
         .route("/simple/{project}", get(simple_project))
         .route("/simple/{project}/", get(simple_project))
-        .route("/pytorch-wheels/{project}", get(pytorch_wheels_project))
-        .route("/pytorch-wheels/{project}/", get(pytorch_wheels_project))
+        .route("/pytorch-wheels", get(pytorch_wheels_root))
+        .route("/pytorch-wheels/", get(pytorch_wheels_root))
+        .route(
+            "/pytorch-wheels/{project}",
+            get(pytorch_wheels_project_or_channel_root),
+        )
+        .route(
+            "/pytorch-wheels/{project}/",
+            get(pytorch_wheels_project_or_channel_root),
+        )
         .route(
             "/pytorch-wheels/{channel}/{project}",
             get(pytorch_wheels_channel_project),
@@ -633,6 +642,133 @@ async fn simple_project(
             text_response(status, "upstream unavailable\n")
         }
     }
+}
+
+async fn pytorch_wheels_root(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Some(response) = project_index_search_redirect(&query, "/pytorch-wheels/") {
+        return response;
+    }
+    trace!("serving pytorch wheels root");
+    match state.pytorch_wheels_upstream.fetch_project_index().await {
+        Ok(Some(projects)) => {
+            project_index_response(&headers, "pytorch-wheels", "/pytorch-wheels/", &projects)
+        }
+        Ok(None) => text_response(StatusCode::NOT_FOUND, "index not found\n"),
+        Err(error) => {
+            warn!(%error, "pytorch wheels root request failed");
+            text_response(StatusCode::BAD_GATEWAY, "upstream unavailable\n")
+        }
+    }
+}
+
+async fn pytorch_wheels_project_or_channel_root(
+    State(state): State<Arc<AppState>>,
+    Path(project): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let normalized = normalize_project_name(&project);
+    if looks_like_pytorch_channel(&normalized) {
+        return pytorch_wheels_channel_root(&state, &normalized, &query, &headers).await;
+    }
+    pytorch_wheels_project(State(state), Path(normalized), headers).await
+}
+
+async fn pytorch_wheels_channel_root(
+    state: &Arc<AppState>,
+    channel: &str,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let base_path = format!("/pytorch-wheels/{channel}/");
+    if let Some(response) = project_index_search_redirect(query, &base_path) {
+        return response;
+    }
+    let upstream = match pytorch_channel_upstream(state, channel) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            warn!(channel, %error, "pytorch wheels channel configuration failed");
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "upstream unavailable\n");
+        }
+    };
+    trace!(channel, "serving pytorch wheels channel root");
+    match upstream.fetch_project_index().await {
+        Ok(Some(projects)) => project_index_response(
+            headers,
+            &format!("pytorch-wheels/{channel}"),
+            &base_path,
+            &projects,
+        ),
+        Ok(None) => text_response(StatusCode::NOT_FOUND, "channel not found\n"),
+        Err(error) => {
+            warn!(channel, %error, "pytorch wheels channel root request failed");
+            text_response(StatusCode::BAD_GATEWAY, "upstream unavailable\n")
+        }
+    }
+}
+
+fn project_index_search_redirect(
+    query: &HashMap<String, String>,
+    base_path: &str,
+) -> Option<Response<Body>> {
+    let project = query.get("q").map(|value| value.trim())?;
+    if project.is_empty() {
+        return None;
+    }
+    let normalized = normalize_project_name(project);
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    response.headers_mut().insert(
+        LOCATION,
+        header(&format!(
+            "{}/{normalized}/",
+            base_path.trim_end_matches('/')
+        )),
+    );
+    Some(response)
+}
+
+fn project_index_response(
+    headers: &HeaderMap,
+    repository: &str,
+    base_path: &str,
+    projects: &[String],
+) -> Response<Body> {
+    let format_json = wants_json(header_value(headers, ACCEPT));
+    let (content_type, body) = if format_json {
+        (
+            json_media_type(),
+            render_root_json_with_base(projects, base_path),
+        )
+    } else {
+        (
+            "text/html; charset=utf-8",
+            render_repository_root_html(repository, base_path, projects),
+        )
+    };
+    render_simple_response(headers, content_type, body, false)
+}
+
+fn looks_like_pytorch_channel(value: &str) -> bool {
+    matches!(value, "cpu" | "nightly" | "test" | "xpu")
+        || value.starts_with("cpu-")
+        || value.starts_with("xpu-")
+        || value.strip_prefix("cu").is_some_and(channel_version_suffix)
+        || value
+            .strip_prefix("rocm")
+            .is_some_and(channel_version_suffix)
+}
+
+fn channel_version_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.starts_with(|ch: char| ch.is_ascii_digit())
+        && suffix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
 }
 
 async fn pytorch_wheels_project(
@@ -2601,6 +2737,25 @@ mod tests {
         assert_eq!(kib_weight(1), 1);
         assert_eq!(kib_weight(1024), 1);
         assert_eq!(kib_weight(1025), 2);
+    }
+
+    #[test]
+    fn recognizes_pytorch_channel_paths_without_treating_projects_as_channels() {
+        for channel in [
+            "cpu",
+            "cpu-cxx11-abi",
+            "cu128",
+            "cu128-full",
+            "nightly",
+            "rocm6.4",
+            "test",
+            "xpu",
+        ] {
+            assert!(looks_like_pytorch_channel(channel), "{channel}");
+        }
+        for project in ["cuda-bindings", "torch", "torch-nightly", "torchvision"] {
+            assert!(!looks_like_pytorch_channel(project), "{project}");
+        }
     }
 
     fn test_state(cache: CacheStore, upstream_base_url: &str) -> AppState {
